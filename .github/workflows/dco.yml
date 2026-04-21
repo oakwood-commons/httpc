@@ -1,0 +1,49 @@
+name: DCO
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  dco:
+    name: DCO Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check DCO sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Determine commit range
+          if git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            commits=$(git log --format=%H "$BASE_SHA".."$HEAD_SHA")
+          else
+            # First PR in repo - check all commits on the branch
+            commits=$(git log --format=%H "$HEAD_SHA")
+          fi
+
+          missing=()
+          for sha in $commits; do
+            if ! git log -1 --format=%B "$sha" | grep -qiP '^Signed-off-by: .+ <.+>'; then
+              missing+=("$sha")
+            fi
+          done
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::The following commits are missing a valid DCO sign-off (Signed-off-by: Name <email>):"
+            for sha in "${missing[@]}"; do
+              echo "  - $(git log -1 --format='%h %s' "$sha")"
+            done
+            echo ""
+            echo "Add sign-off with: git commit --amend -s"
+            exit 1
+          fi
+
+          echo "All commits have DCO sign-off."
