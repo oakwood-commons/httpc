@@ -1,0 +1,415 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: "3"
+
+vars:
+  NAME: "httpc"
+  DEFAULT_GO_VERSION: "1.26.0"
+  GOLANGCI_LINT_VERSION: "v2.11.4"
+  GOIMPORTS_VERSION: "v0.42.0"
+  GOFUMPT_VERSION: "v0.9.2"
+  GOVULNCHECK_VERSION: "v1.1.4"
+  BENCHSTAT_VERSION: "v0.0.0-20260312031701-16a31bc5fbd0"
+  TOOLS: "{{.ROOT_DIR | toSlash}}/.tool"
+  TOOLS_BIN: "{{.TOOLS}}"
+  PATH_SEP: '{{ if eq OS "windows" }};{{ else }}:{{ end }}'
+  TOOLS_PATH: "{{.TOOLS_BIN}}{{.PATH_SEP}}{{ env `PATH` }}"
+  GO_VERSION:
+    sh: |
+      if [ -f go.mod ]; then
+        v="$(awk '/^toolchain[[:space:]]+go/ {print $2}' go.mod | tr -d '\r' | sed 's/^go//')"
+        if [ -n "$v" ]; then
+          echo "$v"
+        else
+          awk '/^go[[:space:]]+/ {print $2; exit}' go.mod | tr -d '\r'
+        fi
+      else
+        echo "{{.DEFAULT_GO_VERSION}}"
+      fi
+  GOTOOLCHAIN: "go{{.GO_VERSION}}"
+  GIT_SHA:
+    sh: git rev-parse --short=12 HEAD || echo "unknown"
+  GIT_BRANCH:
+    sh: git rev-parse --abbrev-ref HEAD || echo "unknown"
+  COVER: "{{.ROOT_DIR | toSlash}}/cover"
+  DATE: '{{ now | date "2006.01.02" }}'
+  BENCH_FILE: "bench/{{.DATE}}.{{.GIT_SHA}}.txt"
+  BENCH_BASELINE: "bench/baseline.txt"
+
+env:
+  CGO_ENABLED: "0"
+  GOTOOLCHAIN: "{{.GOTOOLCHAIN}}"
+  GOWORK: "off"
+  GOLANGCI_LINT_CACHE: "{{.ROOT_DIR}}/.cache/golangci-lint"
+  GOBIN: "{{.TOOLS_BIN}}"
+
+tasks:
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Info
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  default:
+    aliases:
+      - info
+    silent: true
+    desc: Display build and environment information
+    cmds:
+      - |
+        echo "------------------------------------------------------------"
+        echo "httpc Taskfile"
+        echo "------------------------------------------------------------"
+        echo "  GO_VERSION:   {{ .GO_VERSION }}"
+        echo "  GOTOOLCHAIN:  {{ .GOTOOLCHAIN }}"
+        echo "  GIT_SHA:      {{ .GIT_SHA }}"
+        echo "  GIT_BRANCH:   {{ .GIT_BRANCH }}"
+        echo ""
+        echo "Usage:"
+        echo "  task test      # Run tests"
+        echo "  task lint      # Run linter"
+        echo "  task fmt       # Format code"
+        echo "  task ci        # Full CI pipeline"
+        echo "------------------------------------------------------------"
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Cleaning
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  clean:
+    desc: "Clean build artifacts, caches, and temporary files"
+    silent: true
+    cmds:
+      - |
+        echo "Cleaning..."
+        go clean -cache -testcache
+        rm -rf .task/ cover/ bench/
+        find . -name ".DS_Store" -type f -delete
+        echo "Done"
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Modules
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  mod:
+    desc: "Download and tidy Go modules"
+    silent: true
+    sources:
+      - go.mod
+      - go.sum
+    cmds:
+      - go mod download
+      - go mod tidy
+
+  mod:check:
+    desc: "Check if go.mod and go.sum are tidy"
+    silent: true
+    cmds:
+      - |
+        set -e
+        cp go.mod go.mod.bak
+        cp go.sum go.sum.bak
+        go mod tidy > /dev/null 2>&1
+        if diff -q go.mod go.mod.bak > /dev/null 2>&1 && diff -q go.sum go.sum.bak > /dev/null 2>&1; then
+          rm -f go.mod.bak go.sum.bak
+          exit 0
+        fi
+        mv go.mod.bak go.mod
+        mv go.sum.bak go.sum
+        echo "go.mod/go.sum need tidying. Run 'task mod'."
+        exit 1
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Tool Installation
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  install-tools:
+    desc: "Install Go development tools"
+    silent: true
+    run: once
+    env:
+      GOBIN: "{{.TOOLS_BIN}}"
+      GOTOOLCHAIN: "local"
+      PATH: "{{.TOOLS_PATH}}{{.PATH_SEP}}{{ env `PATH` }}"
+    cmds:
+      - |
+        set -e
+        export PATH="{{.TOOLS_PATH}}{{.PATH_SEP}}$PATH"
+        export GOTOOLCHAIN=local
+        mkdir -p "{{.TOOLS_BIN}}"
+
+        install_tool() {
+          local name="$1"
+          local pkg="$2"
+          if ! command -v "$name" >/dev/null 2>&1; then
+            echo "[install] $name"
+            go install "$pkg"
+          fi
+        }
+
+        install_tool golangci-lint "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}"
+        install_tool benchstat "golang.org/x/perf/cmd/benchstat@{{.BENCHSTAT_VERSION}}"
+        install_tool govulncheck "golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}}"
+        install_tool gofumpt "mvdan.cc/gofumpt@{{.GOFUMPT_VERSION}}"
+        install_tool goimports "golang.org/x/tools/cmd/goimports@{{.GOIMPORTS_VERSION}}"
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Formatting
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  fmt:
+    desc: "Auto-format Go code and tidy modules"
+    aliases: [format]
+    deps: [install-tools]
+    silent: true
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    cmds:
+      - |
+        set -e
+        export PATH="{{.TOOLS_PATH}}:$PATH"
+        find . -type f -name '*.go' \
+          -not -path './.cache/*' \
+          -not -path './.task/*' \
+          -not -path './.tool/*' \
+          -print0 | xargs -0 goimports -w
+        find . \
+          -type d \( -name .cache -o -name .task -o -name .tool \) -prune -false \
+          -o -type f -name '*.go' -print0 | xargs -0 gofumpt -w -extra
+        go mod tidy
+        echo "Formatting complete"
+
+  fmt:check:
+    desc: "Check if Go code is properly formatted"
+    aliases: [format:check]
+    deps: [install-tools]
+    silent: true
+    cmds:
+      - |
+        set -e
+        export PATH="{{.TOOLS_PATH}}:$PATH"
+        changes=0
+
+        UNFORMATTED=$(find . \
+          -type d \( -name .cache -o -name .task -o -name .tool \) -prune -false \
+          -o -type f -name '*.go' -print0 | xargs -0 goimports -l 2>/dev/null || true)
+        if [ -n "$UNFORMATTED" ]; then
+          echo "goimports issues:"
+          echo "$UNFORMATTED"
+          changes=1
+        fi
+
+        UNFORMATTED=$(find . \
+          -type d \( -name .cache -o -name .task -o -name .tool \) -prune -false \
+          -o -type f -name '*.go' -print0 | xargs -0 gofumpt -l -extra 2>/dev/null || true)
+        if [ -n "$UNFORMATTED" ]; then
+          echo "gofumpt issues:"
+          echo "$UNFORMATTED"
+          changes=1
+        fi
+
+        if [ "$changes" -ne 0 ]; then
+          echo "Run 'task fmt' to fix."
+          exit 1
+        fi
+        echo "Code formatting is correct"
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Linting & Static Analysis
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  lint:
+    desc: "Run golangci-lint"
+    aliases: [l]
+    silent: true
+    deps: [install-tools]
+    sources:
+      - "**/*.go"
+      - .golangci.yml
+    cmds:
+      - |
+        set -e
+        export PATH="{{.TOOLS_PATH}}:$PATH"
+        mkdir -p "{{.GOLANGCI_LINT_CACHE}}"
+        golangci-lint run ./... --config .golangci.yml --timeout 5m0s
+
+  lint:fix:
+    desc: "Run golangci-lint with auto-fix"
+    deps: [install-tools]
+    silent: true
+    cmds:
+      - |
+        export PATH="{{.TOOLS_PATH}}:$PATH"
+        mkdir -p "{{.GOLANGCI_LINT_CACHE}}"
+        golangci-lint run --fix ./... --config .golangci.yml --timeout 5m0s
+
+  vet:
+    desc: "Run go vet"
+    silent: true
+    cmds:
+      - go vet ./...
+
+  vulncheck:
+    desc: "Check for known vulnerabilities"
+    silent: true
+    deps: [install-tools]
+    cmds:
+      - |
+        export PATH="{{.TOOLS_PATH}}:$PATH"
+        govulncheck ./...
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Building
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  build:
+    desc: "Verify the library compiles"
+    silent: true
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    cmds:
+      - go build ./...
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Testing
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  test:
+    desc: "Run test suite"
+    aliases: [t]
+    env:
+      GOFLAGS: '{{.GOFLAGS | default "-count=1"}}'
+      GOTESTFLAGS: '{{.GOTESTFLAGS | default "-shuffle=on"}}'
+    cmds:
+      - go test $GOTESTFLAGS -timeout 10m ./...
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+
+  test:race:
+    desc: "Run tests with race detector"
+    env:
+      CGO_ENABLED: "1"
+      GOFLAGS: '{{.GOFLAGS | default "-count=1"}}'
+      GOTESTFLAGS: '{{.GOTESTFLAGS | default "-shuffle=on"}}'
+    cmds:
+      - go test $GOTESTFLAGS -race -timeout 10m ./...
+
+  test:e2e:
+    desc: "Run end-to-end tests (lint + coverage)"
+    deps: [vet, lint]
+    cmds:
+      - task: test:cover
+
+  test:cover:
+    desc: "Run tests with coverage profile"
+    silent: true
+    cmds:
+      - mkdir -p {{.COVER}}
+      - go test ./... -coverprofile={{.COVER}}/cover.out -covermode=atomic
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Coverage
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  coverage:
+    desc: "Generate coverage profile"
+    silent: true
+    cmds:
+      - mkdir -p {{.COVER}}
+      - |
+        pkgs=$(go list ./... | paste -sd, -)
+        go test ./... -coverprofile={{.COVER}}/cover.out -covermode=atomic -coverpkg="$pkgs"
+
+  coverage:report:
+    desc: "Print coverage report"
+    silent: true
+    deps: [coverage]
+    cmds:
+      - go tool cover -func={{.COVER}}/cover.out
+
+  coverage:check:
+    desc: "Check coverage meets threshold (default: 70%)"
+    silent: true
+    deps: [coverage]
+    vars:
+      COVERAGE_THRESHOLD: '{{ .COVERAGE_THRESHOLD | default "70.0" }}'
+    cmds:
+      - |
+        set -e
+        TOTAL=$(go tool cover -func={{.COVER}}/cover.out | tail -1 | awk '{print $3}' | tr -d '%')
+        echo "Total coverage: ${TOTAL}%  (threshold: {{.COVERAGE_THRESHOLD}}%)"
+        if awk "BEGIN {exit !(${TOTAL} < {{.COVERAGE_THRESHOLD}})}"; then
+          echo "Coverage ${TOTAL}% is below threshold {{.COVERAGE_THRESHOLD}}%"
+          exit 1
+        fi
+        echo "Coverage meets threshold"
+
+  coverage:html:
+    desc: "Generate HTML coverage report"
+    silent: true
+    deps: [coverage]
+    cmds:
+      - go tool cover -html={{.COVER}}/cover.out -o {{.COVER}}/coverage.html
+      - |
+        echo "Report: {{.COVER}}/coverage.html"
+        if command -v open >/dev/null 2>&1; then
+          open {{.COVER}}/coverage.html
+        elif command -v xdg-open >/dev/null 2>&1; then
+          xdg-open {{.COVER}}/coverage.html
+        fi
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # Benchmarks
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  bench:
+    desc: "Run benchmarks"
+    aliases: [b]
+    vars:
+      BENCH_PATTERN: '{{ .BENCH_PATTERN | default "." }}'
+      BENCH_TIME: '{{ .BENCH_TIME | default "1s" }}'
+      BENCH_COUNT: '{{ .BENCH_COUNT | default "1" }}'
+    cmds:
+      - go test -run='^$' -bench='{{.BENCH_PATTERN}}' -benchmem -benchtime={{.BENCH_TIME}} -count={{.BENCH_COUNT}} ./...
+
+  bench:save:
+    desc: "Run benchmarks and save results"
+    silent: true
+    cmds:
+      - |
+        mkdir -p bench
+        go test ./... -bench=. -benchmem -run='^$' -count=6 -benchtime=50ms > "{{.BENCH_FILE}}"
+
+  bench:compare:
+    desc: "Compare benchmarks against baseline"
+    silent: true
+    deps: [install-tools]
+    cmds:
+      - |
+        export PATH="{{.TOOLS_PATH}}:$PATH"
+        if [ ! -f "{{.BENCH_BASELINE}}" ]; then
+          echo "No baseline. Run 'task bench:save' then copy to {{.BENCH_BASELINE}}"
+          exit 1
+        fi
+        benchstat {{.BENCH_BASELINE}} "{{.BENCH_FILE}}"
+
+  # ──────────────────────────────────────────────────────────────────────────────
+  # CI Pipeline
+  # ──────────────────────────────────────────────────────────────────────────────
+
+  ci:
+    desc: "Full CI pipeline"
+    silent: true
+    cmds:
+      - task: mod
+      - task: build
+      - task: vet
+      - task: lint
+      - task: fmt:check
+      - task: test:race
+      - task: coverage:check
+      - task: vulncheck
