@@ -106,6 +106,11 @@ type ClientConfig struct {
 	// MaxResponseBodySize is the maximum HTTP response body size in bytes.
 	// Defaults to DefaultMaxResponseBodySize (100 MB).
 	MaxResponseBodySize int64
+	// Transport is the base HTTP transport used for network I/O.
+	// If nil, http.DefaultTransport is used.
+	// The provided transport is wrapped with OTel tracing, metrics,
+	// compression, and caching layers as configured.
+	Transport http.RoundTripper
 }
 
 // DefaultConfig returns a ClientConfig with sensible defaults
@@ -210,7 +215,10 @@ func newRetryClient(config *ClientConfig, m Metrics) *retryablehttp.Client {
 	// Wrap the retryClient's inner transport with OTel tracing so every actual
 	// HTTP attempt gets a span and W3C Trace Context headers are injected.
 	{
-		base := retryClient.HTTPClient.Transport
+		base := config.Transport
+		if base == nil {
+			base = retryClient.HTTPClient.Transport
+		}
 		if base == nil {
 			base = http.DefaultTransport
 		}
