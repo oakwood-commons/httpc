@@ -933,3 +933,113 @@ func TestNewClient_MemoryCacheType(t *testing.T) {
 	require.NotNil(t, client)
 	assert.NotNil(t, client.cache)
 }
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestNewClient_CustomTransport(t *testing.T) {
+	var called atomic.Bool
+	customTransport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		called.Store(true)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("custom")),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	cfg := testDefaultConfig()
+	cfg.EnableCache = false
+	cfg.Transport = customTransport
+
+	client := NewClient(cfg)
+	resp, err := client.Get(context.Background(), "http://example.com/test")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	assert.True(t, called.Load(), "custom transport should have been called")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestNewClient_CustomTransportWithCache(t *testing.T) {
+	var callCount atomic.Int32
+	customTransport := roundTripperFunc(func(_ *http.Request) (*http.Response, error) {
+		callCount.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("cached")),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	cfg := testDefaultConfig()
+	cfg.EnableCache = true
+	cfg.CacheType = CacheTypeMemory
+	cfg.Transport = customTransport
+
+	client := NewClient(cfg)
+	ctx := context.Background()
+
+	resp, err := client.Get(ctx, "http://example.com/cacheable")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// Second request should hit cache — transport not called again.
+	resp, err = client.Get(ctx, "http://example.com/cacheable")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	assert.Equal(t, int32(1), callCount.Load(), "transport should only be called once due to caching")
+}
+
+func TestNewClient_CustomTransportWithCompression(t *testing.T) {
+	var sawAcceptEncoding atomic.Bool
+	customTransport := roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.Header.Get("Accept-Encoding"), "gzip") {
+			sawAcceptEncoding.Store(true)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("compressed")),
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	cfg := testDefaultConfig()
+	cfg.EnableCache = false
+	cfg.EnableCompression = true
+	cfg.Transport = customTransport
+
+	client := NewClient(cfg)
+	resp, err := client.Get(context.Background(), "http://example.com/compress")
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	assert.True(t, sawAcceptEncoding.Load(), "compression layer should add Accept-Encoding before reaching custom transport")
+}
+
+func TestNewClient_NilTransportUsesDefault(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("default"))
+	}))
+	defer server.Close()
+
+	cfg := testDefaultConfig()
+	cfg.EnableCache = false
+	cfg.Transport = nil // explicitly nil
+
+	client := NewClient(cfg)
+	resp, err := client.Get(context.Background(), server.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "default", string(body))
+}
