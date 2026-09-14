@@ -282,12 +282,17 @@ func (c *ClientConfig) ipPolicy() *IPPolicy {
 // target is validated (resolving the hostname) in the Proxy hook instead.
 //
 // A caller-supplied transport is only instrumented when it is an
-// *http.Transport that does not already install its own dialer; anything else
-// is used verbatim, and a warning is logged so the downgrade is visible.
+// *http.Transport that does not already install its own dialer -- plain
+// (DialContext/Dial) or TLS (DialTLSContext/DialTLS). A TLS hook counts,
+// because net/http prefers it over DialContext for non-proxied HTTPS, so a
+// transport carrying one would silently bypass the policy. Anything else is
+// used verbatim, and a warning is logged so the downgrade is visible.
 func newBaseTransport(config *ClientConfig, policy *IPPolicy, fallback http.RoundTripper) http.RoundTripper {
 	if config.Transport != nil {
 		t, ok := config.Transport.(*http.Transport)
-		if ok && t.DialContext == nil && t.Dial == nil { //nolint:staticcheck // Dial is deprecated but must still be checked
+		//nolint:staticcheck // Dial/DialTLS are deprecated but must still be checked
+		if ok && t.DialContext == nil && t.Dial == nil &&
+			t.DialTLSContext == nil && t.DialTLS == nil {
 			return policyTransport(t, policy, config.Logger)
 		}
 		config.Logger.Info(

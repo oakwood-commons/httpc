@@ -37,7 +37,10 @@ func TestClientBlocksPrivateURLByDefault(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(ssrfTestConfig())
-	_, err := client.Get(context.Background(), server.URL)
+	resp, err := client.Get(context.Background(), server.URL)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "private/reserved")
 }
@@ -154,6 +157,23 @@ func TestAppConfigMergeAllowedPrivateCIDRs(t *testing.T) {
 
 	unchanged := MergeAppConfig(base, &AppConfig{})
 	assert.Equal(t, []string{"10.0.0.0/8"}, unchanged.AllowedPrivateCIDRs)
+
+	// A non-nil empty override means "no exceptions" and must clear the base
+	// list rather than read as "not specified".
+	cleared := MergeAppConfig(base, &AppConfig{AllowedPrivateCIDRs: []string{}})
+	assert.Empty(t, cleared.AllowedPrivateCIDRs)
+	assert.NotNil(t, cleared.AllowedPrivateCIDRs)
+}
+
+func TestAppConfigEmptyAllowedPrivateCIDRsWinsOverLegacyBoolean(t *testing.T) {
+	allow := true
+	cfg := &AppConfig{AllowPrivateIPs: &allow, AllowedPrivateCIDRs: []string{}}
+
+	client, err := NewClientFromAppConfig(cfg, logr.Discard())
+	require.NoError(t, err)
+	require.NotNil(t, client.config.IPPolicy, "an explicit empty CIDR list must still set a policy")
+	assert.Error(t, client.config.ipPolicy().ValidateURL("http://127.0.0.1/"))
+	assert.Error(t, client.config.ipPolicy().ValidateURL("http://10.0.0.1/"))
 }
 
 // newFakeProxy returns a server that answers any proxied request itself,
@@ -224,6 +244,29 @@ func TestCustomTransportWithOwnDialerIsUsedVerbatim(t *testing.T) {
 
 	got := newBaseTransport(cfg, defaultIPPolicy, nil)
 	assert.Same(t, custom, got, "a transport with its own dialer must not be silently rewrapped")
+}
+
+func TestCustomTransportWithTLSDialHookIsUsedVerbatim(t *testing.T) {
+	// net/http prefers DialTLSContext over DialContext for non-proxied HTTPS,
+	// so wrapping such a transport would advertise enforcement it cannot do.
+	tlsCtx := &http.Transport{
+		DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, fmt.Errorf("unused")
+		},
+	}
+	cfg := ssrfTestConfig()
+	cfg.Transport = tlsCtx
+	assert.Same(t, tlsCtx, newBaseTransport(cfg, defaultIPPolicy, nil))
+
+	//nolint:staticcheck // DialTLS is deprecated but still honoured by net/http
+	tlsLegacy := &http.Transport{
+		DialTLS: func(string, string) (net.Conn, error) {
+			return nil, fmt.Errorf("unused")
+		},
+	}
+	cfg2 := ssrfTestConfig()
+	cfg2.Transport = tlsLegacy
+	assert.Same(t, tlsLegacy, newBaseTransport(cfg2, defaultIPPolicy, nil))
 }
 
 func TestNewBaseTransportDoesNotMutateDefaultTransport(t *testing.T) {

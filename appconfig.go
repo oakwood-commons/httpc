@@ -163,7 +163,10 @@ func NewClientFromAppConfig(cfg *AppConfig, logger logr.Logger) (*Client, error)
 	if cfg.AllowPrivateIPs != nil {
 		clientCfg.AllowPrivateIPs = *cfg.AllowPrivateIPs
 	}
-	if len(cfg.AllowedPrivateCIDRs) > 0 {
+	// A non-nil but empty list is meaningful: it means "no exceptions", and
+	// must still win over a legacy AllowPrivateIPs: true. Only an absent
+	// (nil) list leaves the policy unset.
+	if cfg.AllowedPrivateCIDRs != nil {
 		policy, err := NewIPPolicy(cfg.AllowedPrivateCIDRs...)
 		if err != nil {
 			return nil, fmt.Errorf("invalid allowedPrivateCIDRs: %w", err)
@@ -244,7 +247,9 @@ func MergeAppConfig(base, override *AppConfig) *AppConfig {
 	if override.AllowPrivateIPs != nil {
 		merged.AllowPrivateIPs = override.AllowPrivateIPs
 	}
-	if len(override.AllowedPrivateCIDRs) > 0 {
+	// Non-nil-but-empty overrides the base list, so a narrower scope can clear
+	// inherited exceptions; nil means "not specified" and inherits.
+	if override.AllowedPrivateCIDRs != nil {
 		merged.AllowedPrivateCIDRs = override.AllowedPrivateCIDRs
 	}
 	if override.MaxResponseBodySize > 0 {
