@@ -227,6 +227,12 @@ Cloud instance-metadata endpoints (`169.254.169.254`, `169.254.170.2`,
 `fd00:ec2::254`) are blocked unconditionally and cannot be re-enabled by any
 configuration.
 
+The one case where this library cannot enforce that itself is a name it never
+resolves: with `TrustProxyResolution` enabled, a proxied hostname that does not
+resolve locally is forwarded to the proxy unchecked, so it could resolve at the
+proxy to a metadata address. Enabling that option therefore delegates metadata
+blocking for those names to the proxy. See [Proxies](#proxies).
+
 IPv6 encodings that carry an IPv4 address are judged on that embedded address,
 so `64:ff9b::169.254.169.254` is blocked while `64:ff9b::8.8.8.8` is not --
 blocking the prefixes outright would cut off every IPv4 destination on a

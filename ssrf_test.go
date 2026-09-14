@@ -349,7 +349,8 @@ func TestValidateURLResolved(t *testing.T) {
 	ctx := context.Background()
 	policy := &IPPolicy{}
 
-	// localhost resolves to loopback on every supported platform.
+	// A deliberately unresolvable name: resolution failure must deny rather
+	// than fall through to allowed.
 	err := policy.ValidateURLResolved(ctx, "http://localhost.test.invalid/")
 	require.Error(t, err, "an unresolvable host must fail closed")
 
