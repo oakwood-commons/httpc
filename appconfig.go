@@ -49,7 +49,23 @@ type AppConfig struct {
 	// EnableCompression enables automatic gzip compression.
 	EnableCompression *bool `json:"enableCompression,omitempty" yaml:"enableCompression,omitempty"`
 	// AllowPrivateIPs allows HTTP requests to private/loopback/link-local IP literals.
+	//
+	// Deprecated: use AllowedPrivateCIDRs to unblock only the ranges you need.
 	AllowPrivateIPs *bool `json:"allowPrivateIPs,omitempty" yaml:"allowPrivateIPs,omitempty"`
+	// AllowedPrivateCIDRs lists private/reserved CIDR blocks the client may
+	// connect to, e.g. ["10.0.0.0/8"]. Everything else in the default blocklist
+	// stays blocked. Cloud instance-metadata endpoints can never be allowed.
+	//
+	// When both this and AllowPrivateIPs are set, AllowedPrivateCIDRs wins:
+	// the resulting client reaches only the listed ranges.
+	AllowedPrivateCIDRs []string `json:"allowedPrivateCIDRs,omitempty" yaml:"allowedPrivateCIDRs,omitempty"`
+	// TrustProxyResolution allows a proxied request whose target hostname does
+	// not resolve here to proceed, leaving egress policy to the proxy.
+	//
+	// Defaults to false, which fails closed on any DNS failure for a proxied
+	// target. Enable it only in a proxy-only environment with no direct
+	// resolver, where the proxy is trusted to enforce egress policy itself.
+	TrustProxyResolution *bool `json:"trustProxyResolution,omitempty" yaml:"trustProxyResolution,omitempty"`
 	// MaxResponseBodySize is the maximum HTTP response body size in bytes.
 	MaxResponseBodySize int64 `json:"maxResponseBodySize,omitempty" yaml:"maxResponseBodySize,omitempty"`
 }
@@ -150,9 +166,26 @@ func NewClientFromAppConfig(cfg *AppConfig, logger logr.Logger) (*Client, error)
 		clientCfg.EnableCompression = *cfg.EnableCompression
 	}
 
-	// Apply SSRF setting
+	// Apply SSRF settings
 	if cfg.AllowPrivateIPs != nil {
 		clientCfg.AllowPrivateIPs = *cfg.AllowPrivateIPs
+	}
+	// A non-nil but empty list is meaningful: it means "no exceptions", and
+	// must still win over a legacy AllowPrivateIPs: true. Only an absent
+	// (nil) list leaves the policy unset.
+	if cfg.AllowedPrivateCIDRs != nil {
+		policy, err := NewIPPolicy(cfg.AllowedPrivateCIDRs...)
+		if err != nil {
+			return nil, fmt.Errorf("invalid allowedPrivateCIDRs: %w", err)
+		}
+		clientCfg.IPPolicy = policy
+	}
+	// Applies to whichever policy the config resolves to, including the
+	// implicit one, so it does not require AllowedPrivateCIDRs to be set.
+	if cfg.TrustProxyResolution != nil {
+		policy := *clientCfg.ipPolicy()
+		policy.TrustProxyResolution = *cfg.TrustProxyResolution
+		clientCfg.IPPolicy = &policy
 	}
 
 	// Apply max response body size
@@ -227,6 +260,14 @@ func MergeAppConfig(base, override *AppConfig) *AppConfig {
 	}
 	if override.AllowPrivateIPs != nil {
 		merged.AllowPrivateIPs = override.AllowPrivateIPs
+	}
+	// Non-nil-but-empty overrides the base list, so a narrower scope can clear
+	// inherited exceptions; nil means "not specified" and inherits.
+	if override.AllowedPrivateCIDRs != nil {
+		merged.AllowedPrivateCIDRs = override.AllowedPrivateCIDRs
+	}
+	if override.TrustProxyResolution != nil {
+		merged.TrustProxyResolution = override.TrustProxyResolution
 	}
 	if override.MaxResponseBodySize > 0 {
 		merged.MaxResponseBodySize = override.MaxResponseBodySize

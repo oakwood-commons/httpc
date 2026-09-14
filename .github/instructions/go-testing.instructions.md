@@ -8,17 +8,20 @@ applyTo: "**/*_test.go"
 ## Framework
 
 - Use standard `go test` with **table-driven tests**
-- Use `testify/assert` for assertions
-- Place mocks in `mock.go` files
+- Use `testify`: `require` when a failure makes the rest of the test
+  meaningless, `assert` when it does not
+- Test files are in `package httpc` (white-box), so unexported helpers are
+  available to tests
 
-## E2E Tests
+## Running the suite
 
-E2E tests (`task test:e2e`) are expensive. Follow these rules:
+`task test` runs the unit tests with `-shuffle=on`, so an order-dependent test
+fails intermittently rather than consistently. A test that passes alone and
+fails in the suite is a bug in the test, not flakiness to retry past.
 
-1. Only run when validating a complete set of changes, not for iterative checks
-2. Run **once** and capture output: `task test:e2e 2>&1 | tee /tmp/e2e-results.txt`
-3. Review the saved file instead of re-running: `grep -E 'FAIL|PASS|ok' /tmp/e2e-results.txt`
-4. For iterative development, run targeted unit tests: `go test ./...`
+`task test:e2e` is a misleading name: it runs `vet`, `lint`, and the coverage
+profile. There is no separate end-to-end suite. `task ci` is the full local
+gate.
 
 ## Race Detection
 
@@ -34,19 +37,20 @@ go test -race ./...
 go test -cover ./...
 ```
 
-### Coverage Targets
+### Coverage thresholds
 
-| Code Type | Package Target | Patch Target |
-|-----------|---------------|-------------|
-| Core library code | 80%+ | 80%+ |
-| Critical logic (SSRF, circuit breaker) | 90%+ | 100% |
+Codecov enforces **70% project** coverage (1% threshold) and **50% patch**
+coverage (5% threshold). Those numbers live in `codecov.yml`;
+`task coverage:check` applies the same 70% figure locally.
 
-### Patch Coverage (CRITICAL)
+Treat them as floors, not targets. Security-critical code (`ssrf.go`,
+`circuitbreaker.go`) is held far higher in practice, and a new file with no
+tests will not survive review whatever the percentage says.
 
-Every PR must have **70%+ patch coverage** (percentage of new/changed lines covered by tests). This is enforced by Codecov.
-
-- When adding new code, write tests for it in the same PR
-- Never submit a new file with 0% coverage; at minimum test the happy path and one error path
+- Write the tests in the same change as the code.
+- **A test earns its place by failing.** Break the code it covers and confirm
+  it goes red. An assertion that holds equally against the bug and the fix
+  documents intent but catches nothing.
 
 ## Benchmarks
 

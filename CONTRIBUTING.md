@@ -6,7 +6,7 @@ Thank you for your interest in contributing!
 
 ### Prerequisites
 
-- Go 1.26+
+- Go 1.27.1+ (matching the `go` directive in `go.mod`)
 - [Task](https://taskfile.dev/) runner (`go install github.com/go-task/task/v3/cmd/task@latest`)
 
 ### Building

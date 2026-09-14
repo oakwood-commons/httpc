@@ -1,4 +1,8 @@
-# httpc - AI Agent Instructions
+# httpc - Copilot Instructions
+
+Project context for GitHub Copilot. `AGENTS.md` at the repository root is the
+shared, tool-neutral version and goes into more depth; this file stays short
+and points there rather than keeping a second copy that drifts.
 
 ## Overview
 Production-ready HTTP client library for Go with built-in retries, caching, circuit breaker, compression, and observability.
@@ -13,25 +17,21 @@ Production-ready HTTP client library for Go with built-in retries, caching, circ
 
 ## Build & Test Commands
 
+Use the task targets -- they pin the toolchain and the linters to the versions
+CI runs.
+
 ```bash
-# Build
-go build ./...
-
-# Test
-go test ./...
-
-# Lint
-task lint
-
-# Full CI
-task ci
+task build      # go build ./...
+task test       # unit tests, shuffled
+task lint       # golangci-lint, pinned version
+task ci         # the full local gate; matches what CI checks
 ```
 
 ## Critical Rules
 
 - **No hardcoded app names**: Use configurable `CacheKeyPrefix` and `CacheDir`, never embed "scafctl" or similar
 - **Metrics interface**: All metrics go through the `Metrics` interface, never import a specific metrics backend
-- **Test coverage**: Every new or changed file must have tests. Target 70%+ patch coverage
+- **Test coverage**: Every new or changed file must have tests. Codecov enforces 70% project and 50% patch; treat those as floors
 - **Breaking changes**: Allowed -- this library is pre-1.0. Note when doing so
 - **Git safety**: Never run `git commit`, `git push`, or `git commit --amend` unless the user explicitly asks
 
@@ -42,14 +42,6 @@ task ci
 
 ## Architecture
 
-- `client.go` -- Main HTTP client with retry, caching, circuit breaker
-- `appconfig.go` -- String-based config for YAML/JSON, `NewClientFromAppConfig`, `MergeAppConfig`
-- `defaults.go` -- All default constants and helper functions
-- `metrics.go` -- `Metrics` interface + `NoopMetrics` implementation
-- `circuitbreaker.go` -- Per-host circuit breaker pattern
-- `compression.go` -- Automatic gzip transport
-- `filecache.go` -- Filesystem-based HTTP response cache
-- `memorycache.go` -- Memory cache wrapper with metrics
-- `metrics_transport.go` -- HTTP transport that records metrics
-- `helpers.go` -- Retry policy and backoff builders
-- `ssrf.go` -- SSRF prevention (private IP blocking)
+See `AGENTS.md` for the file-by-file map, the transport chain (the order of
+the layered round-trippers matters), and the three SSRF enforcement points.
+It is kept current there rather than duplicated here.

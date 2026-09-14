@@ -50,6 +50,12 @@ const (
 	// DefaultMaxRedirects is the default maximum number of HTTP redirects to follow.
 	DefaultMaxRedirects = 10
 
+	// defaultDialTimeout matches http.DefaultTransport's dial timeout.
+	defaultDialTimeout = 30 * time.Second
+
+	// defaultDialKeepAlive matches http.DefaultTransport's keep-alive interval.
+	defaultDialKeepAlive = 30 * time.Second
+
 	// httpCacheDirName is the subdirectory name used for HTTP cache storage.
 	httpCacheDirName = "http-cache"
 )
