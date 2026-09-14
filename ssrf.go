@@ -469,8 +469,18 @@ func (p *IPPolicy) ValidateURLResolved(ctx context.Context, rawURL string) error
 // above the transport, so a hit returns without any policy check having run.
 //
 // Only fields that change a verdict are included. Resolver is deliberately
-// excluded -- it is a function value with no stable identity, and it affects
-// how a target is resolved rather than which addresses are permitted.
+// excluded, and that is a known limitation rather than a claim of safety: a
+// custom resolver can change the verdict for a proxied hostname, so clients
+// sharing a CacheDir with identical CIDR settings but different resolvers
+// share a key prefix.
+//
+// Reaching that requires all of: a custom Resolver (exposed mainly as a test
+// seam), a proxy, a filesystem cache on a shared CacheDir, and two clients
+// whose resolvers disagree. Closing it means either hashing the resolver's
+// pointer identity, which silently ends cross-process cache reuse for every
+// custom-resolver caller, or adding a public identifier field to name it --
+// both worse than the gap they close. Revisit if the resolver becomes a
+// production knob rather than a test seam.
 func (p *IPPolicy) fingerprint() string {
 	h := sha256.New()
 	if p == nil {
