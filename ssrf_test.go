@@ -4,6 +4,8 @@
 package httpc
 
 import (
+	"context"
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -42,7 +44,7 @@ func TestValidateURLNotPrivate(t *testing.T) {
 		{name: "loopback 127.255.255.255", url: "http://127.255.255.255/", wantErr: true, errMsg: "private/reserved"},
 
 		// Link-local / cloud metadata - 169.254.0.0/16
-		{name: "link-local 169.254.169.254", url: "http://169.254.169.254/", wantErr: true, errMsg: "private/reserved"},
+		{name: "link-local 169.254.169.254", url: "http://169.254.169.254/", wantErr: true, errMsg: "cloud metadata"},
 		{name: "link-local 169.254.0.1", url: "http://169.254.0.1/", wantErr: true, errMsg: "private/reserved"},
 
 		// CGNAT - 100.64.0.0/10
@@ -73,7 +75,7 @@ func TestValidateURLNotPrivate(t *testing.T) {
 		{name: "hex prefix 0X", url: "http://0X7F000001/", wantErr: true, errMsg: "non-canonical"},
 
 		// Edge cases
-		{name: "empty host (relative URL)", url: "/relative/path", wantErr: false},
+		{name: "empty host (relative URL)", url: "/relative/path", wantErr: true, errMsg: "scheme"},
 		{name: "IP with port", url: "http://10.0.0.1:8080/", wantErr: true, errMsg: "private/reserved"},
 		{name: "localhost with port", url: "http://localhost:3000/", wantErr: true, errMsg: "blocked hostname"},
 		{name: "invalid URL", url: "://invalid", wantErr: true, errMsg: "invalid URL"},
@@ -92,10 +94,20 @@ func TestValidateURLNotPrivate(t *testing.T) {
 	}
 }
 
-func TestBuildPrivateIPNets(t *testing.T) {
-	nets := buildPrivateIPNets()
-	// Should contain all 9 CIDR blocks defined in the source
-	assert.Len(t, nets, 9)
+func TestPrivateIPNets(t *testing.T) {
+	nets := PrivateIPNets()
+	assert.Len(t, nets, len(privateCIDRs))
+	// The returned value is a deep copy: mutating it -- including through the
+	// *net.IPNet pointers -- must not affect the package default.
+	require.NoError(t, ValidateURLNotPrivate("http://93.184.216.34/"))
+	for _, n := range nets {
+		n.IP = net.IPv4zero
+		n.Mask = net.CIDRMask(0, 32)
+	}
+	nets[0] = nil
+	require.Error(t, ValidateURLNotPrivate("http://10.1.2.3/"))
+	require.NoError(t, ValidateURLNotPrivate("http://93.184.216.34/"))
+	assert.NotNil(t, PrivateIPNets()[0])
 }
 
 func TestNonCanonicalIPPattern(t *testing.T) {
@@ -135,4 +147,264 @@ func TestBlockedHostnames(t *testing.T) {
 	// Non-blocked hostname
 	_, ok := blockedHostnames["example.com"]
 	assert.False(t, ok)
+}
+
+// TestValidateURLNotPrivateReservedRanges covers reserved ranges that were
+// previously missing from the blocklist. 0.0.0.0 in particular routes to
+// loopback on Linux, making it a direct bypass of the loopback block.
+func TestValidateURLNotPrivateReservedRanges(t *testing.T) {
+	blocked := []string{
+		"http://0.0.0.0/",
+		"http://0.1.2.3/",
+		"http://240.0.0.1/",
+		"http://255.255.255.255/",
+		"http://192.0.0.1/",
+		"http://198.18.0.1/",
+		"http://[::]/",
+	}
+	for _, u := range blocked {
+		t.Run(u, func(t *testing.T) {
+			require.Error(t, ValidateURLNotPrivate(u))
+		})
+	}
+}
+
+func TestValidateURLNotPrivateSchemes(t *testing.T) {
+	tests := []struct {
+		url     string
+		wantErr bool
+	}{
+		{url: "http://example.com/", wantErr: false},
+		{url: "https://example.com/", wantErr: false},
+		{url: "HTTPS://example.com/", wantErr: false},
+		{url: "file:///etc/passwd", wantErr: true},
+		{url: "gopher://example.com/", wantErr: true},
+		{url: "ftp://example.com/", wantErr: true},
+		{url: "example.com/path", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			err := ValidateURLNotPrivate(tt.url)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestNewIPPolicyExceptions(t *testing.T) {
+	policy, err := NewIPPolicy("10.0.0.0/8")
+	require.NoError(t, err)
+
+	require.NoError(t, policy.ValidateURL("http://10.1.2.3/artifacts"))
+	require.Error(t, policy.ValidateURL("http://192.168.1.1/"))
+	require.Error(t, policy.ValidateURL("http://127.0.0.1/"))
+
+	_, err = NewIPPolicy("not-a-cidr")
+	require.Error(t, err)
+}
+
+// TestIPPolicyMetadataNonExemptible asserts the metadata endpoints cannot be
+// re-enabled, no matter how permissive the policy is.
+func TestIPPolicyMetadataNonExemptible(t *testing.T) {
+	permissive, err := NewIPPolicy("169.254.0.0/16", "0.0.0.0/0", "::/0")
+	require.NoError(t, err)
+
+	policies := map[string]*IPPolicy{
+		"exception covers IMDS": permissive,
+		"allow all private":     AllowAllPrivateIPs(),
+		"default":               {},
+	}
+	targets := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://169.254.170.2/v2/credentials",
+		"http://[fd00:ec2::254]/latest/meta-data/",
+	}
+	for name, policy := range policies {
+		for _, target := range targets {
+			t.Run(name+" "+target, func(t *testing.T) {
+				err := policy.ValidateURL(target)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "cloud metadata")
+			})
+		}
+	}
+
+	// Link-local addresses that are not metadata remain exemptible.
+	require.NoError(t, permissive.ValidateURL("http://169.254.1.1/"))
+}
+
+func TestAllowAllPrivateIPs(t *testing.T) {
+	policy := AllowAllPrivateIPs()
+	require.NoError(t, policy.ValidateURL("http://10.0.0.1/"))
+	require.NoError(t, policy.ValidateURL("http://127.0.0.1:8080/"))
+	require.Error(t, policy.ValidateURL("http://169.254.169.254/"))
+	// Scheme and non-canonical checks still apply.
+	require.Error(t, policy.ValidateURL("file:///etc/passwd"))
+	require.Error(t, policy.ValidateURL("http://2130706433/"))
+}
+
+func TestValidateURLNotPrivateExcept(t *testing.T) {
+	require.NoError(t, ValidateURLNotPrivateExcept("http://10.0.0.1/", "10.0.0.0/8"))
+	require.Error(t, ValidateURLNotPrivateExcept("http://127.0.0.1/", "10.0.0.0/8"))
+	require.Error(t, ValidateURLNotPrivateExcept("http://169.254.169.254/", "169.254.0.0/16"))
+	require.Error(t, ValidateURLNotPrivateExcept("http://10.0.0.1/", "bogus"))
+}
+
+// TestIPPolicyControlFunc exercises the dial-time hook directly. This is the
+// check that catches a hostname resolving to a private address, since it runs
+// on the resolved sockaddr rather than on the URL.
+func TestIPPolicyControlFunc(t *testing.T) {
+	control := (&IPPolicy{}).ControlFunc()
+
+	require.Error(t, control("tcp4", "127.0.0.1:80", nil))
+	require.Error(t, control("tcp4", "169.254.169.254:80", nil))
+	require.Error(t, control("tcp4", "0.0.0.0:80", nil))
+	require.Error(t, control("tcp6", "[::1]:80", nil))
+	require.NoError(t, control("tcp4", "93.184.216.34:443", nil))
+
+	// A non-address string must fail closed rather than pass through.
+	require.Error(t, control("tcp4", "example.com:80", nil))
+
+	allowLoopback, err := NewIPPolicy("127.0.0.0/8")
+	require.NoError(t, err)
+	require.NoError(t, allowLoopback.ControlFunc()("tcp4", "127.0.0.1:80", nil))
+	require.Error(t, allowLoopback.ControlFunc()("tcp4", "169.254.169.254:80", nil))
+}
+
+func TestIPPolicyCheckIPNilReceiverAndIP(t *testing.T) {
+	var policy *IPPolicy
+	require.Error(t, policy.CheckIP(net.ParseIP("127.0.0.1")))
+	require.NoError(t, policy.CheckIP(net.ParseIP("93.184.216.34")))
+	require.Error(t, policy.CheckIP(nil))
+}
+
+func TestMetadataIPNetsIsCopy(t *testing.T) {
+	nets := MetadataIPNets()
+	require.NotEmpty(t, nets)
+	for _, n := range nets {
+		n.IP = net.IPv4zero
+		n.Mask = net.CIDRMask(0, 32)
+	}
+	nets[0] = nil
+	// The non-exemptible guarantee must survive that mutation.
+	require.Error(t, AllowAllPrivateIPs().ValidateURL("http://169.254.169.254/"))
+	require.NoError(t, AllowAllPrivateIPs().ValidateURL("http://93.184.216.34/"))
+	assert.NotNil(t, MetadataIPNets()[0])
+}
+
+// TestValidateURLNotPrivateTrailingDot covers the FQDN form of a blocked
+// hostname, which resolves identically but misses a naive map lookup.
+func TestValidateURLNotPrivateTrailingDot(t *testing.T) {
+	for _, u := range []string{
+		"http://localhost./",
+		"http://LOCALHOST./",
+		"http://metadata.google.internal./computeMetadata/v1/",
+	} {
+		t.Run(u, func(t *testing.T) {
+			err := ValidateURLNotPrivate(u)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "blocked hostname")
+		})
+	}
+}
+
+// TestValidateURLNotPrivateEmbeddedIPv4 covers IPv6 encodings that carry an
+// IPv4 address inside them and route to it where the transition mechanism is
+// enabled -- classic SSRF bypass forms.
+func TestValidateURLNotPrivateEmbeddedIPv4(t *testing.T) {
+	blocked := []string{
+		"http://[::ffff:127.0.0.1]/",         // IPv4-mapped loopback
+		"http://[::169.254.169.254]/",        // IPv4-compatible
+		"http://[64:ff9b::169.254.169.254]/", // NAT64 well-known prefix
+		"http://[64:ff9b:1::a00:1]/",         // NAT64 local-use prefix (blocked wholesale)
+		"http://[2002:a9fe:a9fe::1]/",        // 6to4 -> 169.254.169.254
+	}
+	for _, u := range blocked {
+		t.Run("blocked "+u, func(t *testing.T) {
+			err := ValidateURLNotPrivate(u)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrBlockedByPolicy)
+		})
+	}
+
+	// Only the EMBEDDED address decides. Blanket-blocking these prefixes would
+	// break every IPv4 destination on a DNS64/NAT64 or 6to4 network.
+	allowed := []string{
+		"http://[::ffff:8.8.8.8]/",
+		"http://[64:ff9b::8.8.8.8]/",
+		"http://[2002:0808:0808::1]/",
+	}
+	for _, u := range allowed {
+		t.Run("allowed "+u, func(t *testing.T) {
+			require.NoError(t, ValidateURLNotPrivate(u))
+		})
+	}
+}
+
+func TestValidateURLResolved(t *testing.T) {
+	ctx := context.Background()
+	policy := &IPPolicy{}
+
+	// localhost resolves to loopback on every supported platform.
+	err := policy.ValidateURLResolved(ctx, "http://localhost.test.invalid/")
+	require.Error(t, err, "an unresolvable host must fail closed")
+
+	// IP literals short-circuit without a DNS lookup.
+	require.NoError(t, policy.ValidateURLResolved(ctx, "http://93.184.216.34/"))
+	require.Error(t, policy.ValidateURLResolved(ctx, "http://127.0.0.1/"))
+	require.Error(t, policy.ValidateURLResolved(ctx, "file:///etc/passwd"))
+}
+
+// TestBlockedErrorsWrapSentinel pins the sentinel that keeps deterministic
+// refusals out of the retry loop.
+func TestBlockedErrorsWrapSentinel(t *testing.T) {
+	for _, u := range []string{
+		"http://127.0.0.1/",
+		"http://169.254.169.254/",
+		"http://localhost/",
+		"http://2130706433/",
+		"file:///etc/passwd",
+		"/relative",
+	} {
+		t.Run(u, func(t *testing.T) {
+			err := ValidateURLNotPrivate(u)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrBlockedByPolicy)
+		})
+	}
+
+	assert.ErrorIs(t, (&IPPolicy{}).CheckIP(nil), ErrBlockedByPolicy)
+	assert.ErrorIs(t, (&IPPolicy{}).ControlFunc()("tcp", "not-an-ip:80", nil), ErrBlockedByPolicy)
+}
+
+// TestNonDecodablePrefixIsNonExemptible pins that the NAT64 local-use prefix,
+// whose embedded IPv4 address cannot be located reliably, is blocked on the
+// same terms as cloud metadata: no policy can allow it. Blocking it via the
+// ordinary private list would let AllowPrivateIPs reach IMDS through it.
+func TestNonDecodablePrefixIsNonExemptible(t *testing.T) {
+	permissive, err := NewIPPolicy("64:ff9b:1::/48", "::/0")
+	require.NoError(t, err)
+
+	policies := map[string]*IPPolicy{
+		"default":           {},
+		"allow all private": AllowAllPrivateIPs(),
+		"explicit CIDR":     permissive,
+	}
+	targets := []string{
+		"http://[64:ff9b:1::a9fe:a9fe]/",
+		"http://[64:ff9b:1:0:0:0:a9fe:a9fe]/",
+		"http://[64:ff9b:1::a00:1]/",
+	}
+	for name, policy := range policies {
+		for _, target := range targets {
+			t.Run(name+" "+target, func(t *testing.T) {
+				err := policy.ValidateURL(target)
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrBlockedByPolicy)
+			})
+		}
+	}
 }

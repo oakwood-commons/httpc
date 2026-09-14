@@ -49,7 +49,16 @@ type AppConfig struct {
 	// EnableCompression enables automatic gzip compression.
 	EnableCompression *bool `json:"enableCompression,omitempty" yaml:"enableCompression,omitempty"`
 	// AllowPrivateIPs allows HTTP requests to private/loopback/link-local IP literals.
+	//
+	// Deprecated: use AllowedPrivateCIDRs to unblock only the ranges you need.
 	AllowPrivateIPs *bool `json:"allowPrivateIPs,omitempty" yaml:"allowPrivateIPs,omitempty"`
+	// AllowedPrivateCIDRs lists private/reserved CIDR blocks the client may
+	// connect to, e.g. ["10.0.0.0/8"]. Everything else in the default blocklist
+	// stays blocked. Cloud instance-metadata endpoints can never be allowed.
+	//
+	// When both this and AllowPrivateIPs are set, AllowedPrivateCIDRs wins:
+	// the resulting client reaches only the listed ranges.
+	AllowedPrivateCIDRs []string `json:"allowedPrivateCIDRs,omitempty" yaml:"allowedPrivateCIDRs,omitempty"`
 	// MaxResponseBodySize is the maximum HTTP response body size in bytes.
 	MaxResponseBodySize int64 `json:"maxResponseBodySize,omitempty" yaml:"maxResponseBodySize,omitempty"`
 }
@@ -150,9 +159,16 @@ func NewClientFromAppConfig(cfg *AppConfig, logger logr.Logger) (*Client, error)
 		clientCfg.EnableCompression = *cfg.EnableCompression
 	}
 
-	// Apply SSRF setting
+	// Apply SSRF settings
 	if cfg.AllowPrivateIPs != nil {
 		clientCfg.AllowPrivateIPs = *cfg.AllowPrivateIPs
+	}
+	if len(cfg.AllowedPrivateCIDRs) > 0 {
+		policy, err := NewIPPolicy(cfg.AllowedPrivateCIDRs...)
+		if err != nil {
+			return nil, fmt.Errorf("invalid allowedPrivateCIDRs: %w", err)
+		}
+		clientCfg.IPPolicy = policy
 	}
 
 	// Apply max response body size
@@ -227,6 +243,9 @@ func MergeAppConfig(base, override *AppConfig) *AppConfig {
 	}
 	if override.AllowPrivateIPs != nil {
 		merged.AllowPrivateIPs = override.AllowPrivateIPs
+	}
+	if len(override.AllowedPrivateCIDRs) > 0 {
+		merged.AllowedPrivateCIDRs = override.AllowedPrivateCIDRs
 	}
 	if override.MaxResponseBodySize > 0 {
 		merged.MaxResponseBodySize = override.MaxResponseBodySize

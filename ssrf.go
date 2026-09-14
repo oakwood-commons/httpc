@@ -4,38 +4,161 @@
 package httpc
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
-// privateIPNets holds the CIDR blocks considered private/reserved.
-// Requests to IP literals within these ranges are blocked when AllowPrivateIPs is false.
-var privateIPNets = buildPrivateIPNets() //nolint:gochecknoglobals
+// privateCIDRs lists the CIDR blocks considered private or otherwise reserved.
+// Requests to addresses within these ranges are blocked by the default policy.
+var privateCIDRs = []string{ //nolint:gochecknoglobals
+	"0.0.0.0/8",          // RFC 1122 "this network"; 0.0.0.0 routes to loopback on Linux
+	"10.0.0.0/8",         // RFC 1918
+	"172.16.0.0/12",      // RFC 1918
+	"192.168.0.0/16",     // RFC 1918
+	"127.0.0.0/8",        // IPv4 loopback
+	"169.254.0.0/16",     // IPv4 link-local / cloud metadata (AWS, GCP, Azure IMDS)
+	"100.64.0.0/10",      // RFC 6598 shared address space (CGNAT)
+	"192.0.0.0/24",       // RFC 6890 IETF protocol assignments
+	"198.18.0.0/15",      // RFC 2544 benchmarking
+	"240.0.0.0/4",        // RFC 1112 reserved (class E)
+	"255.255.255.255/32", // limited broadcast
+	"::/128",             // IPv6 unspecified
+	"::1/128",            // IPv6 loopback
+	"fc00::/7",           // IPv6 unique local
+	"fe80::/10",          // IPv6 link-local
+}
 
-func buildPrivateIPNets() []*net.IPNet {
-	cidrs := []string{
-		"10.0.0.0/8",     // RFC 1918
-		"172.16.0.0/12",  // RFC 1918
-		"192.168.0.0/16", // RFC 1918
-		"127.0.0.0/8",    // IPv4 loopback
-		"169.254.0.0/16", // IPv4 link-local / cloud metadata (AWS, GCP, Azure IMDS)
-		"100.64.0.0/10",  // RFC 6598 shared address space (CGNAT)
-		"::1/128",        // IPv6 loopback
-		"fc00::/7",       // IPv6 unique local
-		"fe80::/10",      // IPv6 link-local
+// metadataCIDRs are the cloud instance-metadata endpoints. They are blocked
+// unconditionally: no exception list can re-enable them, because the IMDS
+// endpoint is the single highest-value SSRF target and a caller asking for
+// "the 169.254.0.0/16 link-local range" almost never means "and also IMDS".
+var metadataCIDRs = []string{ //nolint:gochecknoglobals
+	"169.254.169.254/32", // AWS / GCP / Azure / DigitalOcean / OpenStack IMDS
+	"169.254.170.2/32",   // AWS ECS task metadata
+	"fd00:ec2::254/128",  // AWS IMDS over IPv6
+}
+
+// ErrBlockedByPolicy wraps every SSRF-policy denial, so callers (and the retry
+// policy) can distinguish a deliberate refusal from a transient network error.
+var ErrBlockedByPolicy = errors.New("blocked by SSRF policy")
+
+// The prefixes below are IPv6 prefixes that carry an IPv4 address inside
+// them and route to it where the transition mechanism is enabled. Rather than
+// blocking these wholesale -- which would break every IPv4 destination on a
+// DNS64/NAT64 network -- the embedded address is extracted and checked against
+// the same rules as a native IPv4 address.
+//
+// Only prefixes with a fixed length are decoded. RFC 8215's 64:ff9b:1::/48 is
+// explicitly variable-length, so the IPv4 payload could sit at any of five
+// offsets; guessing one would both miss blocked targets and misread legitimate
+// ones, so that prefix is blocked wholesale instead (see nonDecodableCIDRs).
+var (
+	nat64WellKnownNet = mustParseCIDRs([]string{"64:ff9b::/96"})[0] //nolint:gochecknoglobals
+	ipv4CompatibleNet = mustParseCIDRs([]string{"::/96"})[0]        //nolint:gochecknoglobals
+)
+
+// embeddedIPv4 returns the IPv4 address carried inside an IPv6 address that
+// uses a known transition encoding, or nil if there is none.
+//
+// IPv4-mapped addresses (::ffff:a.b.c.d) are not handled here: net.IPNet
+// .Contains already normalises those via To4, so they are checked natively.
+func embeddedIPv4(ip net.IP) net.IP {
+	if ip.To4() != nil {
+		return nil // already IPv4 (or IPv4-mapped), checked directly
 	}
+	ip16 := ip.To16()
+	if ip16 == nil {
+		return nil
+	}
+	switch {
+	case ip16[0] == 0x20 && ip16[1] == 0x02: // RFC 3056 6to4: 2002:V4ADDR::/48
+		return net.IPv4(ip16[2], ip16[3], ip16[4], ip16[5])
+	case nat64WellKnownNet.Contains(ip16): // RFC 6052 well-known prefix, fixed at /96
+		return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
+	case ipv4CompatibleNet.Contains(ip16): // RFC 4291 ::a.b.c.d
+		// Exclude :: and ::1, which are not IPv4-compatible addresses and are
+		// already covered by the blocklist.
+		if ip16[12] == 0 && ip16[13] == 0 && ip16[14] == 0 {
+			return nil
+		}
+		return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
+	}
+	return nil
+}
+
+// nonDecodableCIDRs are IPv6 transition prefixes that embed an IPv4 address at
+// an offset this package cannot determine. They are blocked on the same terms
+// as metadataCIDRs -- no policy can allow them -- because allowing one would
+// silently allow every IPv4 destination it can encode, cloud metadata included.
+var nonDecodableCIDRs = []string{ //nolint:gochecknoglobals
+	"64:ff9b:1::/48", // RFC 8215 NAT64 local-use prefix, variable prefix length
+}
+
+// nonDecodableIPNets holds the parsed form of nonDecodableCIDRs.
+var nonDecodableIPNets = mustParseCIDRs(nonDecodableCIDRs) //nolint:gochecknoglobals
+
+// privateIPNets holds the parsed form of privateCIDRs.
+var privateIPNets = mustParseCIDRs(privateCIDRs) //nolint:gochecknoglobals
+
+// metadataIPNets holds the parsed form of metadataCIDRs.
+var metadataIPNets = mustParseCIDRs(metadataCIDRs) //nolint:gochecknoglobals
+
+// defaultIPPolicy is the policy used when none is configured: block every
+// private and reserved range, with no exceptions.
+var defaultIPPolicy = &IPPolicy{} //nolint:gochecknoglobals
+
+func mustParseCIDRs(cidrs []string) []*net.IPNet {
 	nets := make([]*net.IPNet, 0, len(cidrs))
 	for _, cidr := range cidrs {
 		_, network, err := net.ParseCIDR(cidr)
 		if err != nil {
-			panic(fmt.Sprintf("httpc: invalid private CIDR %q: %v", cidr, err))
+			panic(fmt.Sprintf("httpc: invalid CIDR %q: %v", cidr, err))
 		}
 		nets = append(nets, network)
 	}
 	return nets
+}
+
+// PrivateIPNets returns the exemptible CIDR blocks blocked by the default
+// policy -- those an IPPolicy can carve exceptions out of. Cloud metadata (see
+// MetadataIPNets) and non-decodable IPv6 transition prefixes are blocked
+// unconditionally and are NOT included here.
+//
+// The returned value is a deep copy, so callers may inspect or filter it
+// without affecting the package defaults.
+func PrivateIPNets() []*net.IPNet {
+	return cloneIPNets(privateIPNets)
+}
+
+// MetadataIPNets returns the cloud instance-metadata CIDR blocks that are
+// blocked unconditionally and cannot be allowed by an IPPolicy exception.
+func MetadataIPNets() []*net.IPNet {
+	return cloneIPNets(metadataIPNets)
+}
+
+// cloneIPNets deep-copies a CIDR list so that callers cannot mutate the
+// package-level blocklists through the returned values.
+func cloneIPNets(nets []*net.IPNet) []*net.IPNet {
+	out := make([]*net.IPNet, len(nets))
+	for i, n := range nets {
+		out[i] = &net.IPNet{
+			IP:   append(net.IP(nil), n.IP...),
+			Mask: append(net.IPMask(nil), n.Mask...),
+		}
+	}
+	return out
+}
+
+// allowedSchemes are the URL schemes httpc is willing to request.
+var allowedSchemes = map[string]struct{}{ //nolint:gochecknoglobals
+	"http":  {},
+	"https": {},
 }
 
 // nonCanonicalIPPattern matches numeric-only, hex-prefixed, or octal-style
@@ -54,72 +177,275 @@ var nonCanonicalIPPattern = regexp.MustCompile( //nolint:gochecknoglobals
 )
 
 // blockedHostnames contains well-known hostnames that resolve to private or
-// metadata IP addresses. Unlike arbitrary hostnames we cannot (and should not)
-// DNS-resolve, these are static aliases that always point to loopback or cloud
-// metadata endpoints. Blocking them prevents trivial SSRF bypasses such as
-// http://localhost/... or http://metadata.google.internal/...
+// metadata IP addresses. These are rejected before any DNS lookup happens so
+// that trivial bypasses such as http://localhost/... fail fast with a clear
+// message; the dial-time check is what actually guarantees enforcement.
 var blockedHostnames = map[string]struct{}{ //nolint:gochecknoglobals
 	"localhost":                {},
 	"localhost.localdomain":    {},
 	"metadata.google.internal": {}, // GCP instance metadata
+	"metadata.goog":            {}, // GCP instance metadata (short alias)
 }
 
-// ValidateURLNotPrivate returns an error if rawURL's host is an IP literal
-// that falls within a private, loopback, link-local, or CGNAT range, or if
-// the hostname is a well-known alias for a private/metadata address.
+// normaliseHost lower-cases a hostname and strips the FQDN trailing dot, so
+// that "LOCALHOST." matches the same rules as "localhost". DNS treats both
+// forms identically; a naive map lookup would not.
+func normaliseHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+// IPPolicy decides which destination IP addresses a client may connect to.
 //
-// Non-canonical IP forms (decimal, hex, octal) that net.ParseIP does not
-// recognise are also rejected, because some HTTP stacks silently convert
-// them to standard IPs.
+// The zero value blocks every private, loopback, link-local, CGNAT, and
+// otherwise reserved range (see PrivateIPNets). This is the secure default.
 //
-// Arbitrary hostnames are not pre-resolved because DNS lookups introduce
-// TOCTOU races and are not appropriate for a CLI tool. However, well-known
-// hostnames (localhost, metadata.google.internal) are blocked because they
-// have static, predictable resolutions.
-func ValidateURLNotPrivate(rawURL string) error {
+// Exceptions are expressed as CIDR blocks so that a caller who needs, say, an
+// internal artifact server on 10.0.0.0/8 does not have to unblock the whole
+// private address space. Cloud instance-metadata endpoints (see
+// MetadataIPNets) are never reachable, regardless of AllowPrivate or
+// AllowedCIDRs.
+type IPPolicy struct {
+	// AllowPrivate disables private/reserved-range blocking entirely, except
+	// for the non-exemptible metadata ranges.
+	AllowPrivate bool
+
+	// AllowedCIDRs carves specific ranges out of the default blocklist.
+	// Ignored when AllowPrivate is true (which already allows more).
+	AllowedCIDRs []*net.IPNet
+
+	// Resolver is used by ValidateURLResolved. Defaults to net.DefaultResolver.
+	// Exposed primarily so the resolved path can be tested without DNS.
+	Resolver Resolver
+}
+
+// Resolver is the subset of *net.Resolver that IPPolicy needs.
+type Resolver interface {
+	LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error)
+}
+
+// NewIPPolicy builds an IPPolicy that blocks all private and reserved ranges
+// except the supplied CIDR blocks. It returns an error if any CIDR is invalid.
+//
+//	policy, err := httpc.NewIPPolicy("10.0.0.0/8")
+//
+// Cloud metadata endpoints remain blocked even if an exception would cover
+// them, so NewIPPolicy("169.254.0.0/16") still denies 169.254.169.254.
+func NewIPPolicy(allowedCIDRs ...string) (*IPPolicy, error) {
+	nets := make([]*net.IPNet, 0, len(allowedCIDRs))
+	for _, cidr := range allowedCIDRs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid allowed CIDR %q: %w", cidr, err)
+		}
+		nets = append(nets, network)
+	}
+	return &IPPolicy{AllowedCIDRs: nets}, nil
+}
+
+// AllowAllPrivateIPs returns a policy that permits every private and reserved
+// range. Cloud instance-metadata endpoints remain blocked.
+func AllowAllPrivateIPs() *IPPolicy {
+	return &IPPolicy{AllowPrivate: true}
+}
+
+// CheckIP reports whether the policy permits connecting to ip.
+func (p *IPPolicy) CheckIP(ip net.IP) error {
+	if ip == nil {
+		return fmt.Errorf("%w: invalid IP address", ErrBlockedByPolicy)
+	}
+
+	// Non-exemptible: cloud instance metadata.
+	for _, network := range metadataIPNets {
+		if network.Contains(ip) {
+			return fmt.Errorf(
+				"%w: request to cloud metadata address %s is blocked and cannot be allowed by policy",
+				ErrBlockedByPolicy, ip,
+			)
+		}
+	}
+
+	for _, network := range nonDecodableIPNets {
+		if network.Contains(ip) {
+			return fmt.Errorf(
+				"%w: request to %s is blocked and cannot be allowed by policy: the prefix embeds "+
+					"an IPv4 address at an indeterminate offset, so it cannot be checked",
+				ErrBlockedByPolicy, ip,
+			)
+		}
+	}
+
+	// IPv6 encodings that carry an IPv4 address are checked on that address, so
+	// e.g. 64:ff9b::169.254.169.254 is blocked while 64:ff9b::8.8.8.8 is not.
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		if err := p.CheckIP(v4); err != nil {
+			return fmt.Errorf("%s embeds a blocked IPv4 address: %w", ip, err)
+		}
+	}
+
+	if p == nil {
+		p = defaultIPPolicy
+	}
+	if p.AllowPrivate {
+		return nil
+	}
+
+	for _, network := range privateIPNets {
+		if !network.Contains(ip) {
+			continue
+		}
+		if p.allows(ip) {
+			return nil
+		}
+		return fmt.Errorf(
+			"%w: request to private/reserved IP address %s is blocked; "+
+				"set ClientConfig.IPPolicy to allow the ranges you need",
+			ErrBlockedByPolicy, ip,
+		)
+	}
+
+	return nil
+}
+
+// allows reports whether ip falls inside one of the policy's exceptions.
+func (p *IPPolicy) allows(ip net.IP) bool {
+	for _, network := range p.AllowedCIDRs {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateURL checks rawURL's scheme and, when the host is an IP literal, the
+// address itself. Hostnames are not resolved here; see IPPolicy.ControlFunc
+// for the dial-time check that covers DNS results.
+func (p *IPPolicy) ValidateURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 
-	host := u.Hostname()
-	if host == "" {
-		return nil
+	scheme := strings.ToLower(u.Scheme)
+	if _, ok := allowedSchemes[scheme]; !ok {
+		return fmt.Errorf("%w: URL scheme %q is not allowed (only http and https are supported)",
+			ErrBlockedByPolicy, u.Scheme)
 	}
 
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("%w: URL %q has no host", ErrBlockedByPolicy, rawURL)
+	}
+
+	host = normaliseHost(host)
+
 	// Block well-known hostnames that always resolve to private/metadata IPs.
-	if _, blocked := blockedHostnames[strings.ToLower(host)]; blocked {
+	if _, blocked := blockedHostnames[host]; blocked {
 		return fmt.Errorf(
-			"request to blocked hostname %q is denied (resolves to a private/metadata address); "+
-				"set AllowPrivateIPs to true to allow private network access",
-			host,
+			"%w: request to blocked hostname %q is denied (resolves to a private/metadata address)",
+			ErrBlockedByPolicy, host,
 		)
 	}
 
 	// Reject non-canonical IP representations that net.ParseIP won't catch.
 	if nonCanonicalIPPattern.MatchString(host) {
 		return fmt.Errorf(
-			"request to non-canonical IP literal %q is blocked (potential SSRF bypass); "+
+			"%w: request to non-canonical IP literal %q is blocked (potential SSRF bypass); "+
 				"use a standard dotted-decimal or bracketed IPv6 address instead",
-			host,
+			ErrBlockedByPolicy, host,
 		)
 	}
 
-	// Only check IP literals; plain hostnames pass through.
+	// Only check IP literals; plain hostnames are enforced at dial time.
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return nil
 	}
 
-	for _, network := range privateIPNets {
-		if network.Contains(ip) {
-			return fmt.Errorf(
-				"request to private/reserved IP address %s is blocked (AllowPrivateIPs is false); "+
-					"set AllowPrivateIPs to true to allow private network access",
-				ip,
-			)
-		}
+	return p.CheckIP(ip)
+}
+
+// ValidateURLResolved performs ValidateURL and, for hostnames, additionally
+// resolves the host and checks every returned address against the policy.
+//
+// This is a best-effort check with an inherent TOCTOU window: DNS may return
+// different answers to the resolver that actually connects. Prefer
+// ControlFunc, which runs on the socket address. ValidateURLResolved exists
+// for the proxied case, where the proxy -- not this process -- resolves and
+// connects to the target, so no dial-time hook can see it.
+func (p *IPPolicy) ValidateURLResolved(ctx context.Context, rawURL string) error {
+	if err := p.ValidateURL(rawURL); err != nil {
+		return err
 	}
 
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %w", err)
+	}
+	host := normaliseHost(u.Hostname())
+	if net.ParseIP(host) != nil {
+		return nil // already checked as a literal by ValidateURL
+	}
+
+	resolver := Resolver(net.DefaultResolver)
+	if p != nil && p.Resolver != nil {
+		resolver = p.Resolver
+	}
+	addrs, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve host %q: %w", host, err)
+	}
+	for _, addr := range addrs {
+		if err := p.CheckIP(addr.IP); err != nil {
+			return fmt.Errorf("host %q resolves to a blocked address: %w", host, err)
+		}
+	}
 	return nil
+}
+
+// ControlFunc returns a net.Dialer.Control function that enforces the policy
+// on the concrete address being connected to, after DNS resolution.
+//
+// This is the authoritative check: unlike URL validation it cannot be bypassed
+// by a hostname that resolves to a private address, by DNS rebinding, or by a
+// redirect chain, because it runs on the actual socket address.
+func (p *IPPolicy) ControlFunc() func(network, address string, c syscall.RawConn) error {
+	return func(_, address string, _ syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			// Address is not host:port; fall back to treating it as a bare host.
+			host = address
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return fmt.Errorf("%w: refusing to dial unresolvable address %q", ErrBlockedByPolicy, address)
+		}
+		return p.CheckIP(ip)
+	}
+}
+
+// ValidateURLNotPrivate returns an error if rawURL uses a scheme other than
+// http/https, or if its host is an IP literal that falls within a private,
+// loopback, link-local, or otherwise reserved range, or is a well-known alias
+// for a private/metadata address.
+//
+// Non-canonical IP forms (decimal, hex, octal) that net.ParseIP does not
+// recognise are also rejected, because some HTTP stacks silently convert
+// them to standard IPs.
+//
+// Arbitrary hostnames are not pre-resolved, because DNS lookups introduce
+// TOCTOU races. Clients built by NewClient additionally enforce the policy at
+// dial time, which closes that gap.
+func ValidateURLNotPrivate(rawURL string) error {
+	return defaultIPPolicy.ValidateURL(rawURL)
+}
+
+// ValidateURLNotPrivateExcept behaves like ValidateURLNotPrivate but permits
+// addresses inside the supplied CIDR blocks. Cloud instance-metadata
+// endpoints remain blocked regardless of the exceptions given.
+func ValidateURLNotPrivateExcept(rawURL string, allowedCIDRs ...string) error {
+	policy, err := NewIPPolicy(allowedCIDRs...)
+	if err != nil {
+		return err
+	}
+	return policy.ValidateURL(rawURL)
 }

@@ -8,7 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -99,7 +103,17 @@ type ClientConfig struct {
 	Metrics Metrics
 	// AllowPrivateIPs allows HTTP requests to private/loopback/link-local IP literals.
 	// Defaults to false (deny), enforcing secure-by-default behaviour.
+	//
+	// Deprecated: use IPPolicy instead, which allows specific ranges to be
+	// unblocked without also unblocking everything else. AllowPrivateIPs is
+	// still honoured when IPPolicy is nil, and is equivalent to
+	// IPPolicy: AllowAllPrivateIPs().
 	AllowPrivateIPs bool
+	// IPPolicy controls which destination IP addresses the client may connect
+	// to. When nil, AllowPrivateIPs is consulted for backwards compatibility.
+	// The policy is enforced on the request URL, on every redirect target, and
+	// at dial time on the resolved address.
+	IPPolicy *IPPolicy
 	// MaxRedirects is the maximum number of HTTP redirects to follow.
 	// Defaults to DefaultMaxRedirects (10).
 	MaxRedirects int
@@ -212,24 +226,21 @@ func newRetryClient(config *ClientConfig, m Metrics) *retryablehttp.Client {
 		retryClient.Logger = nil
 	}
 
+	// Resolve the IP policy once so the dial-time and redirect checks share a
+	// single value.
+	policy := config.ipPolicy()
+
 	// Wrap the retryClient's inner transport with OTel tracing so every actual
 	// HTTP attempt gets a span and W3C Trace Context headers are injected.
 	{
-		base := config.Transport
-		if base == nil {
-			base = retryClient.HTTPClient.Transport
-		}
-		if base == nil {
-			base = http.DefaultTransport
-		}
+		base := newBaseTransport(config, policy, retryClient.HTTPClient.Transport)
 		retryClient.HTTPClient.Transport = otelhttp.NewTransport(base)
 	}
 
-	// Validate redirect targets against private IP ranges when AllowPrivateIPs is
-	// false. net/http follows redirects automatically, so a public URL that 30x-
-	// redirects to a private IP literal (e.g. 169.254.169.254) would bypass the
-	// initial ValidateURLNotPrivate check without this hook.
-	allowPrivate := config.AllowPrivateIPs
+	// Validate redirect targets against the IP policy. net/http follows
+	// redirects automatically, so a public URL that 30x-redirects to a private
+	// IP literal (e.g. 169.254.169.254) would bypass the initial check without
+	// this hook.
 	maxRedirects := config.MaxRedirects
 	if maxRedirects <= 0 {
 		maxRedirects = DefaultMaxRedirects
@@ -238,15 +249,240 @@ func newRetryClient(config *ClientConfig, m Metrics) *retryablehttp.Client {
 		if len(via) >= maxRedirects {
 			return fmt.Errorf("stopped after %d redirects", len(via))
 		}
-		if !allowPrivate {
-			if err := ValidateURLNotPrivate(req.URL.String()); err != nil {
-				return err
-			}
-		}
-		return nil
+		return policy.ValidateURL(req.URL.String())
 	}
 
 	return retryClient
+}
+
+// ipPolicy resolves the effective IP policy for a config, honouring the
+// deprecated AllowPrivateIPs boolean when no explicit policy is set.
+func (c *ClientConfig) ipPolicy() *IPPolicy {
+	if c.IPPolicy != nil {
+		return c.IPPolicy
+	}
+	if c.AllowPrivateIPs {
+		return AllowAllPrivateIPs()
+	}
+	return defaultIPPolicy
+}
+
+// newBaseTransport returns the transport used for network I/O, with the IP
+// policy enforced at dial time on the resolved peer address.
+//
+// Dial-time enforcement is what makes the policy real: URL validation only
+// sees the literal host, so a hostname resolving to a private address (or a
+// DNS rebind between check and connect) would otherwise slip through.
+//
+// Proxies are handled separately. When a request goes through a proxy, the
+// transport dials the PROXY, not the target, so the dial hook would both
+// (a) reject a proxy that itself lives on a private address -- the common
+// corporate case -- and (b) never see the target address at all. Dials for a
+// request that selected a proxy are therefore exempt from the policy, and the
+// target is validated (resolving the hostname) in the Proxy hook instead.
+//
+// A caller-supplied transport is only instrumented when it is an
+// *http.Transport that does not already install its own dialer; anything else
+// is used verbatim, and a warning is logged so the downgrade is visible.
+func newBaseTransport(config *ClientConfig, policy *IPPolicy, fallback http.RoundTripper) http.RoundTripper {
+	if config.Transport != nil {
+		t, ok := config.Transport.(*http.Transport)
+		if ok && t.DialContext == nil && t.Dial == nil { //nolint:staticcheck // Dial is deprecated but must still be checked
+			return policyTransport(t, policy, config.Logger)
+		}
+		config.Logger.Info(
+			"httpc: custom Transport installs its own dialer or is not an *http.Transport; " +
+				"dial-time SSRF enforcement is disabled for it and remains the caller's responsibility",
+		)
+		return config.Transport
+	}
+
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return policyTransport(t, policy, config.Logger)
+	}
+	if fallback != nil {
+		return fallback
+	}
+	return http.DefaultTransport
+}
+
+// proxyMarker records, for a single request, whether the transport selected a
+// proxy for it. When it did, the only address the transport dials is the
+// proxy, so that dial must skip the policy check.
+type proxyMarker struct {
+	proxied atomic.Bool
+}
+
+// proxyMarkerKey is the context key under which a request's proxyMarker is
+// carried from the RoundTrip wrapper to the Proxy and DialContext hooks.
+type proxyMarkerKeyType struct{}
+
+var proxyMarkerKey = proxyMarkerKeyType{} //nolint:gochecknoglobals
+
+// policyTransport clones t and wires the policy into its dialer and, when a
+// proxy is configured, into its proxy selection. The clone means each client
+// owns its connection pool rather than sharing http.DefaultTransport's.
+func policyTransport(t *http.Transport, policy *IPPolicy, logger logr.Logger) http.RoundTripper {
+	clone := t.Clone()
+
+	var targetCache targetVerdictCache
+
+	if proxyFor := clone.Proxy; proxyFor != nil {
+		clone.Proxy = func(req *http.Request) (*url.URL, error) {
+			proxyURL, err := proxyFor(req)
+			if err != nil || proxyURL == nil {
+				return proxyURL, err
+			}
+			// The proxy resolves and connects to the target on our behalf, so
+			// the dial hook will never see the target address. Validate it
+			// here instead -- the only chance we get.
+			if err := validateProxiedTarget(req, policy, &targetCache, logger); err != nil {
+				return nil, err
+			}
+			if marker, ok := req.Context().Value(proxyMarkerKey).(*proxyMarker); ok {
+				marker.proxied.Store(true)
+			}
+			return proxyURL, nil
+		}
+	}
+
+	enforcing := &net.Dialer{
+		Timeout:   defaultDialTimeout,
+		KeepAlive: defaultDialKeepAlive,
+		Control:   policy.ControlFunc(),
+	}
+	plain := &net.Dialer{
+		Timeout:   defaultDialTimeout,
+		KeepAlive: defaultDialKeepAlive,
+	}
+
+	clone.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// Exemption is scoped to the single request whose Proxy hook set the
+		// marker, so an address that merely happens to equal some proxy's
+		// cannot launder a direct request past the policy.
+		if marker, ok := ctx.Value(proxyMarkerKey).(*proxyMarker); ok && marker.proxied.Load() {
+			return plain.DialContext(ctx, network, addr)
+		}
+		return enforcing.DialContext(ctx, network, addr)
+	}
+
+	return &markingTransport{base: clone}
+}
+
+// proxiedTargetTTL is how long a proxied target's verdict is reused. The Proxy
+// hook runs on every round trip, including ones served from an idle
+// connection, so without this a steady stream of requests to one host would
+// pay a synchronous DNS round trip each time. Concurrent first requests to the
+// same host are not deduplicated; only repeats are. The window is far shorter
+// than the TOCTOU window this check already accepts by its nature.
+const proxiedTargetTTL = 30 * time.Second
+
+// maxProxiedTargetEntries caps the verdict cache. Targets can be
+// attacker-influenced (webhook fetchers, link previewers), so the cache must
+// not grow without bound.
+const maxProxiedTargetEntries = 1024
+
+// targetVerdictCache memoises proxied-target validation per host.
+type targetVerdictCache struct {
+	entries sync.Map // normalised host -> *targetVerdict
+	size    atomic.Int64
+}
+
+type targetVerdict struct {
+	err     error
+	expires time.Time
+}
+
+func (c *targetVerdictCache) check(host string, now time.Time, validate func() error) error {
+	if cached, ok := c.entries.Load(host); ok {
+		verdict, _ := cached.(*targetVerdict)
+		if verdict != nil && now.Before(verdict.expires) {
+			return verdict.err
+		}
+	}
+
+	err := validate()
+
+	// Only deterministic verdicts are cached. A resolver timeout or a cancelled
+	// request context says nothing about the host, and caching it would turn
+	// one slow lookup into a TTL-long outage for that host.
+	if err != nil && !errors.Is(err, ErrBlockedByPolicy) {
+		return err
+	}
+
+	c.evictIfFull(now)
+	if _, loaded := c.entries.Swap(host, &targetVerdict{err: err, expires: now.Add(proxiedTargetTTL)}); !loaded {
+		c.size.Add(1)
+	}
+	return err
+}
+
+// evictIfFull drops expired entries once the cache reaches its cap, and clears
+// it outright if that did not free anything.
+func (c *targetVerdictCache) evictIfFull(now time.Time) {
+	if c.size.Load() < maxProxiedTargetEntries {
+		return
+	}
+	c.entries.Range(func(key, value any) bool {
+		if verdict, ok := value.(*targetVerdict); ok && now.Before(verdict.expires) {
+			return true
+		}
+		if _, loaded := c.entries.LoadAndDelete(key); loaded {
+			c.size.Add(-1)
+		}
+		return true
+	})
+	if c.size.Load() >= maxProxiedTargetEntries {
+		c.entries.Clear()
+		c.size.Store(0)
+	}
+}
+
+// validateProxiedTarget checks a proxied request's target URL, resolving the
+// hostname so a name pointing at a blocked address is caught.
+//
+// A "no such host" answer is deliberately NOT fatal: in a proxy-only
+// environment the client often has no direct resolver, and a name this process
+// cannot resolve is not one it can be tricked into connecting to either. A
+// timeout or other temporary failure IS fatal, because there the name does
+// resolve -- just not for us right now -- and an attacker who can induce a
+// resolver hiccup would otherwise get an unchecked egress path.
+func validateProxiedTarget(req *http.Request, policy *IPPolicy, cache *targetVerdictCache, logger logr.Logger) error {
+	err := cache.check(normaliseHost(req.URL.Hostname()), time.Now(), func() error {
+		return policy.ValidateURLResolved(req.Context(), req.URL.String())
+	})
+	if err == nil {
+		return nil
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		logger.V(1).Info(
+			"httpc: proxied target does not resolve here; deferring egress policy to the proxy",
+			"host", req.URL.Hostname(), "error", err.Error(),
+		)
+		return nil
+	}
+	return err
+}
+
+// markingTransport attaches a per-request proxyMarker before delegating, so
+// the Proxy and DialContext hooks can agree on whether a given dial is to a
+// proxy.
+type markingTransport struct {
+	base *http.Transport
+}
+
+func (m *markingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := context.WithValue(req.Context(), proxyMarkerKey, &proxyMarker{})
+	return m.base.RoundTrip(req.WithContext(ctx))
+}
+
+// CloseIdleConnections forwards to the wrapped transport. Note that the
+// outer wrappers (otelhttp, caching, metrics) do not implement the method, so
+// http.Client.CloseIdleConnections does not currently reach this; it is here so
+// the wrapper is not the reason the chain is broken.
+func (m *markingTransport) CloseIdleConnections() {
+	m.base.CloseIdleConnections()
 }
 
 // newCache creates the cache backend based on config.CacheType.
@@ -341,10 +577,8 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	// Enforce SSRF protection on the initial request URL (not just redirects).
-	if !c.config.AllowPrivateIPs {
-		if err := ValidateURLNotPrivate(req.URL.String()); err != nil {
-			return nil, err
-		}
+	if err := c.config.ipPolicy().ValidateURL(req.URL.String()); err != nil {
+		return nil, err
 	}
 
 	// Check circuit breaker if enabled
@@ -678,6 +912,12 @@ func (c *Client) Close() error {
 // wrapCheckRetryWithMetrics wraps a CheckRetry function to track retry metrics
 func wrapCheckRetryWithMetrics(original retryablehttp.CheckRetry, m Metrics) retryablehttp.CheckRetry {
 	return func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		// An SSRF-policy denial is deterministic: retrying it only multiplies
+		// latency, logs, and metrics for a request that can never succeed.
+		if errors.Is(err, ErrBlockedByPolicy) {
+			return false, err
+		}
+
 		shouldRetry := false
 		var checkErr error
 

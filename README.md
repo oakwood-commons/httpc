@@ -125,7 +125,8 @@ client := httpc.NewClientFromAppConfig(merged, logger)
 | `EnableCircuitBreaker` | `bool` | `false` | Enable circuit breaker pattern |
 | `CircuitBreakerConfig` | `*CircuitBreakerConfig` | See below | Circuit breaker settings |
 | `EnableCompression` | `bool` | `true` | Enable gzip compression |
-| `AllowPrivateIPs` | `bool` | `false` | Allow requests to private/internal IPs |
+| `AllowPrivateIPs` | `bool` | `false` | Deprecated: allow requests to all private/internal IPs |
+| `IPPolicy` | `*IPPolicy` | `nil` | Which destination IPs may be reached (see SSRF Protection) |
 | `Metrics` | `Metrics` | `NoopMetrics{}` | Metrics collector interface |
 | `Logger` | `logr.Logger` | Discard | Logger for client operations |
 
@@ -212,16 +213,96 @@ stats := client.CacheStats()
 
 ### SSRF Protection
 
-By default, requests to private/internal IP ranges are blocked. Protection covers
-IP literals and a small set of well-known private hostnames (e.g., `localhost`,
-`metadata.google.internal`). It does **not** DNS-resolve arbitrary hostnames, so
-a hostname that resolves to a private IP will not be blocked. Disable with:
+By default, requests to private, loopback, link-local, CGNAT, and other reserved
+IP ranges are blocked. The policy is enforced in three places:
+
+- the request URL (scheme allowlist -- only `http`/`https` -- plus IP literals,
+  non-canonical IP forms such as `0x7f000001`, and well-known hostnames like
+  `localhost`)
+- every redirect target
+- **at dial time, on the resolved address**, so a hostname that resolves to a
+  private IP (including DNS rebinding) is blocked too
+
+Cloud instance-metadata endpoints (`169.254.169.254`, `169.254.170.2`,
+`fd00:ec2::254`) are blocked unconditionally and cannot be re-enabled by any
+configuration.
+
+IPv6 encodings that carry an IPv4 address are judged on that embedded address,
+so `64:ff9b::169.254.169.254` is blocked while `64:ff9b::8.8.8.8` is not --
+blocking the prefixes outright would cut off every IPv4 destination on a
+DNS64/NAT64 network. This covers IPv4-mapped `::ffff:a.b.c.d` (handled natively
+by Go's `net` package), IPv4-compatible `::a.b.c.d`, NAT64 `64:ff9b::/96`, and
+6to4 `2002::/16`. The one exception is RFC 8215's `64:ff9b:1::/48`, whose prefix
+length is variable: the embedded address cannot be located reliably, so that
+range is blocked wholesale and, like the metadata endpoints, cannot be
+re-enabled by any policy.
+
+Every denial wraps `httpc.ErrBlockedByPolicy`, so it can be identified with
+`errors.Is` and is never retried.
+
+Two behaviour changes to note when upgrading: non-`http(s)` schemes and URLs
+with no host (e.g. a bare path) are now rejected by `ValidateURLNotPrivate`
+rather than passing, and the scheme check applies even when private addresses
+are allowed.
+
+To reach a specific internal range, allow just that range rather than disabling
+protection wholesale:
 
 ~~~go
+policy, err := httpc.NewIPPolicy("10.0.0.0/8")
+if err != nil {
+    return err
+}
 config := httpc.DefaultConfig()
-config.AllowPrivateIPs = true
+config.IPPolicy = policy
 client := httpc.NewClient(config)
 ~~~
+
+Or, via `AppConfig`:
+
+~~~yaml
+allowedPrivateCIDRs:
+  - 10.0.0.0/8
+~~~
+
+To allow every private range (metadata endpoints still excluded):
+
+~~~go
+config.IPPolicy = httpc.AllowAllPrivateIPs()
+~~~
+
+`config.AllowPrivateIPs = true` is the deprecated equivalent, kept for
+backwards compatibility and ignored when `IPPolicy` is set.
+
+A caller-supplied `ClientConfig.Transport` only gets dial-time enforcement if it
+is an `*http.Transport` without its own dialer; otherwise it is used verbatim, a
+warning is logged, and securing it is the caller's responsibility. Note that
+this includes passing `http.DefaultTransport` explicitly -- it has its own
+dialer, so it is used as-is, whereas leaving `Transport` nil clones it and wires
+the policy in.
+
+#### Proxies
+
+When a request goes through a proxy, the client dials the proxy rather than the
+target, so the dial-time check cannot see the target address. In that case:
+
+- dials belonging to that request are exempt from the policy, since they go to
+  the proxy (a proxy on a private address is the normal corporate setup). The
+  exemption is scoped to the individual request, so it cannot be reused to reach
+  the proxy's address directly.
+- the target is validated in the proxy-selection hook instead, including a DNS
+  lookup of the target host -- best-effort, with the TOCTOU window that dial-time
+  enforcement otherwise avoids
+- if that lookup fails, the request proceeds and egress policy is left to the
+  proxy: a proxy-only environment often has no direct resolver, and a name this
+  process cannot resolve is not one it can be tricked into connecting to
+
+#### Connection pooling
+
+Each client builds its own transport (a clone of `http.DefaultTransport`) so the
+policy can be wired into the dialer. Clients therefore do not share
+`http.DefaultTransport`'s idle-connection pool. Reuse a single client rather than
+constructing many short-lived ones.
 
 ## Thread Safety
 
