@@ -242,7 +242,18 @@ func newRetryClient(config *ClientConfig, m Metrics) (*retryablehttp.Client, int
 	// Wrap the retryClient's inner transport with OTel tracing so every actual
 	// HTTP attempt gets a span and W3C Trace Context headers are injected.
 	base := newBaseTransport(config, policy, retryClient.HTTPClient.Transport)
-	idleCloser, _ := base.(interface{ CloseIdleConnections() })
+	// Only the clone this package created is owned by this client, so only it
+	// is safe for Close to shut down. A caller-owned transport (or
+	// http.DefaultTransport itself) is returned verbatim and may be shared
+	// with other clients; closing its idle pool would disrupt them.
+	//
+	// Declared as the interface and assigned only on a successful assertion:
+	// assigning a nil *markingTransport directly would produce a non-nil
+	// interface holding a nil pointer, which Close would then call into.
+	var idleCloser interface{ CloseIdleConnections() }
+	if owned, ok := base.(*markingTransport); ok {
+		idleCloser = owned
+	}
 	retryClient.HTTPClient.Transport = otelhttp.NewTransport(base)
 
 	// Validate redirect targets against the IP policy. net/http follows
@@ -505,7 +516,10 @@ func (c *targetVerdictCache) evictIfFull(now time.Time) {
 // for proxy-only environments with no direct resolver; every other DNS error
 // stays fatal either way.
 func validateProxiedTarget(req *http.Request, policy *IPPolicy, cache *targetVerdictCache, logger logr.Logger) error {
-	err := cache.check(normaliseHost(req.URL.Hostname()), time.Now(), func() error {
+	// The cache key keeps the trailing dot: "host." and "host" are different
+	// DNS queries (absolute vs. search-domain-expanded), so collapsing them
+	// would let a verdict for one answer for the other.
+	err := cache.check(lowerHost(req.URL.Hostname()), time.Now(), func() error {
 		return policy.ValidateURLResolved(req.Context(), req.URL.String())
 	})
 	if err == nil {
@@ -961,8 +975,8 @@ func (c *Client) CacheStats() *CacheStats {
 // Close gracefully shuts down the client and cleans up resources
 // For filesystem cache, this performs a cleanup of expired entries
 func (c *Client) Close() error {
-	// Each client owns its transport, so its idle connections are not shared
-	// with any other client and must be released here.
+	// Only a transport this package cloned is owned by this client; a
+	// caller-supplied one may be shared, and is deliberately left alone.
 	if c.idleCloser != nil {
 		c.idleCloser.CloseIdleConnections()
 	}

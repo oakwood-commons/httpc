@@ -45,7 +45,10 @@ var privateCIDRs = []string{ //nolint:gochecknoglobals
 var metadataCIDRs = []string{ //nolint:gochecknoglobals
 	"169.254.169.254/32", // AWS / GCP / Azure / DigitalOcean / OpenStack IMDS
 	"169.254.170.2/32",   // AWS ECS task metadata
+	"169.254.170.23/32",  // AWS EKS Pod Identity Agent
 	"fd00:ec2::254/128",  // AWS IMDS over IPv6
+	"fd00:ec2::23/128",   // AWS EKS Pod Identity Agent over IPv6
+	"100.100.100.200/32", // Alibaba Cloud ECS metadata
 }
 
 // ErrBlockedByPolicy wraps every SSRF-policy denial, so callers (and the retry
@@ -193,11 +196,23 @@ var blockedHostnames = map[string]struct{}{ //nolint:gochecknoglobals
 	"metadata.goog":            {}, // GCP instance metadata (short alias)
 }
 
-// normaliseHost lower-cases a hostname and strips the FQDN trailing dot, so
-// that "LOCALHOST." matches the same rules as "localhost". DNS treats both
-// forms identically; a naive map lookup would not.
-func normaliseHost(host string) string {
-	return strings.TrimSuffix(strings.ToLower(host), ".")
+// lowerHost lower-cases a hostname, which DNS treats as insignificant. The
+// FQDN trailing dot is deliberately PRESERVED: it is not cosmetic, it forces
+// an absolute lookup, whereas the undotted spelling may be expanded through
+// the resolver's search domains. "host." and "host" can therefore resolve to
+// different addresses, so they must stay distinct wherever the value is used
+// for a DNS lookup or as a cache identity.
+func lowerHost(host string) string {
+	return strings.ToLower(host)
+}
+
+// hostAlias normalises a hostname for comparison against the static
+// blockedHostnames table, where the trailing dot IS insignificant: "LOCALHOST."
+// and "localhost" name the same well-known target, and the table holds no
+// entry whose meaning depends on search-domain expansion. Use this ONLY for
+// such alias matching -- never for a lookup or a cache key (see lowerHost).
+func hostAlias(host string) string {
+	return strings.TrimSuffix(lowerHost(host), ".")
 }
 
 // IPPolicy decides which destination IP addresses a client may connect to.
@@ -335,6 +350,12 @@ func (p *IPPolicy) CheckIP(ip net.IP) error {
 // allows reports whether ip falls inside one of the policy's exceptions.
 func (p *IPPolicy) allows(ip net.IP) bool {
 	for _, network := range p.AllowedCIDRs {
+		// AllowedCIDRs is a public field, so a caller-built policy can carry a
+		// nil entry. Skip it rather than panicking: malformed input must
+		// produce a denial, never a crash in a library consumer.
+		if network == nil {
+			continue
+		}
 		if network.Contains(ip) {
 			return true
 		}
@@ -362,10 +383,11 @@ func (p *IPPolicy) ValidateURL(rawURL string) error {
 		return fmt.Errorf("%w: URL %q has no host", ErrBlockedByPolicy, rawURL)
 	}
 
-	host = normaliseHost(host)
+	host = lowerHost(host)
 
 	// Block well-known hostnames that always resolve to private/metadata IPs.
-	if _, blocked := blockedHostnames[host]; blocked {
+	// Matched on the alias form, where a trailing dot is insignificant.
+	if _, blocked := blockedHostnames[hostAlias(host)]; blocked {
 		return fmt.Errorf(
 			"%w: request to blocked hostname %q is denied (resolves to a private/metadata address)",
 			ErrBlockedByPolicy, host,
@@ -373,7 +395,10 @@ func (p *IPPolicy) ValidateURL(rawURL string) error {
 	}
 
 	// Reject non-canonical IP representations that net.ParseIP won't catch.
-	if nonCanonicalIPPattern.MatchString(host) {
+	// An IP literal's meaning does not depend on the trailing dot, so the
+	// address checks below use the alias form.
+	literal := hostAlias(host)
+	if nonCanonicalIPPattern.MatchString(literal) {
 		return fmt.Errorf(
 			"%w: request to non-canonical IP literal %q is blocked (potential SSRF bypass); "+
 				"use a standard dotted-decimal or bracketed IPv6 address instead",
@@ -384,7 +409,7 @@ func (p *IPPolicy) ValidateURL(rawURL string) error {
 	// Only check IP literals; plain hostnames are enforced at dial time. The
 	// zone is stripped for parsing so a scoped literal is judged as the IP it
 	// is, rather than falling through as if it were a hostname.
-	ip := net.ParseIP(stripZone(host))
+	ip := net.ParseIP(stripZone(literal))
 	if ip == nil {
 		return nil
 	}
@@ -409,8 +434,11 @@ func (p *IPPolicy) ValidateURLResolved(ctx context.Context, rawURL string) error
 	if err != nil {
 		return fmt.Errorf("invalid URL: %w", err)
 	}
-	host := normaliseHost(u.Hostname())
-	if net.ParseIP(stripZone(host)) != nil {
+	// The trailing dot is preserved for the lookup: it selects an absolute
+	// query, so resolving the undotted spelling instead could check a
+	// different name than the one the request (or a proxy) actually uses.
+	host := lowerHost(u.Hostname())
+	if net.ParseIP(stripZone(hostAlias(host))) != nil {
 		return nil // already checked as a literal by ValidateURL
 	}
 

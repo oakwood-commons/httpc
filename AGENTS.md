@@ -87,7 +87,9 @@ placing it in the wrong list is how an exemption silently reaches metadata.
 
 These are observable in the code; match them rather than inventing your own.
 
-- **License header on every file**, enforced by the `goheader` linter:
+- **License header on every Go source file**, enforced by the `goheader`
+  linter (it inspects `.go` files only -- Markdown, YAML and JSON files in
+  this repo carry no header):
 
   ```go
   // Copyright 2025-2026 Oakwood Commons

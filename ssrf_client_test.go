@@ -606,28 +606,43 @@ func TestTargetVerdictCacheEvictsWhenFull(t *testing.T) {
 	assert.Less(t, cache.size.Load(), int64(maxProxiedTargetEntries))
 }
 
-// TestProxiedTargetCacheKeyIsNormalised pins that host spellings which DNS
-// treats as one name share a cache entry.
+// TestProxiedTargetCacheKeyIsNormalised pins which host spellings share a
+// cache entry. Case is DNS-insignificant and shares one verdict; the FQDN
+// trailing dot is NOT -- it forces an absolute lookup where the undotted
+// spelling may be expanded through search domains, so the two can resolve
+// differently and must be cached apart.
 func TestProxiedTargetCacheKeyIsNormalised(t *testing.T) {
-	proxy, _ := newFakeProxy(t)
-	var lookups atomic.Int64
-	cfg := proxiedConfig(t, proxy)
-	cfg.IPPolicy = &IPPolicy{Resolver: countingResolver{
-		count: &lookups,
-		addrs: []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}},
-	}}
-	client := NewClient(cfg)
-
-	for _, target := range []string{
-		"http://example.test/",
-		"http://EXAMPLE.test/",
-		"http://example.test./",
-	} {
-		resp, err := client.Get(context.Background(), target)
-		require.NoError(t, err, target)
-		_ = resp.Body.Close()
+	newClient := func(lookups *atomic.Int64) *Client {
+		proxy, _ := newFakeProxy(t)
+		cfg := proxiedConfig(t, proxy)
+		cfg.IPPolicy = &IPPolicy{Resolver: countingResolver{
+			count: lookups,
+			addrs: []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}},
+		}}
+		return NewClient(cfg)
 	}
-	assert.Equal(t, int64(1), lookups.Load(), "host spellings of one name must share a verdict")
+	get := func(client *Client, targets ...string) {
+		t.Helper()
+		for _, target := range targets {
+			resp, err := client.Get(context.Background(), target)
+			require.NoError(t, err, target)
+			_ = resp.Body.Close()
+		}
+	}
+
+	t.Run("case is insignificant", func(t *testing.T) {
+		var lookups atomic.Int64
+		get(newClient(&lookups), "http://example.test/", "http://EXAMPLE.test/")
+		assert.Equal(t, int64(1), lookups.Load(),
+			"case-only spellings of one name must share a verdict")
+	})
+
+	t.Run("trailing dot is a distinct identity", func(t *testing.T) {
+		var lookups atomic.Int64
+		get(newClient(&lookups), "http://example.test/", "http://example.test./")
+		assert.Equal(t, int64(2), lookups.Load(),
+			"an absolute name must not be answered by the undotted name's verdict")
+	})
 }
 
 func TestTargetVerdictCacheReusesDeterministicVerdicts(t *testing.T) {
@@ -867,4 +882,43 @@ func TestCacheIsNotSharedAcrossPolicies(t *testing.T) {
 	require.Error(t, err, "a restrictive client must not read the permissive client's cached response")
 	assert.Contains(t, err.Error(), "private/reserved")
 	assert.Equal(t, int64(1), serverHits.Load(), "the blocked request must not reach the server either")
+}
+
+// closeCountingTransport is a caller-supplied transport that records whether
+// its shared idle pool was closed.
+type closeCountingTransport struct {
+	closed atomic.Int64
+}
+
+func (t *closeCountingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("not used")
+}
+
+func (t *closeCountingTransport) CloseIdleConnections() { t.closed.Add(1) }
+
+// TestCloseLeavesCallerOwnedTransportAlone pins that Client.Close only shuts
+// down a transport this package cloned. A caller-supplied transport is used
+// verbatim and may back several clients, so closing its idle pool would
+// disrupt the others.
+func TestCloseLeavesCallerOwnedTransportAlone(t *testing.T) {
+	shared := &closeCountingTransport{}
+	cfg := ssrfTestConfig()
+	cfg.Transport = shared
+
+	client := NewClient(cfg)
+	require.NoError(t, client.Close())
+
+	assert.Equal(t, int64(0), shared.closed.Load(),
+		"Close must not shut down a transport the caller owns and may share")
+}
+
+// TestCloseClosesOwnedTransport is the positive counterpart, so the check
+// above cannot pass by never closing anything.
+func TestCloseClosesOwnedTransport(t *testing.T) {
+	client := NewClient(ssrfTestConfig())
+
+	owned, ok := client.idleCloser.(*markingTransport)
+	require.True(t, ok, "expected a client-owned transport, got %T", client.idleCloser)
+	require.NotNil(t, owned)
+	require.NoError(t, client.Close())
 }

@@ -511,3 +511,86 @@ func TestIPPolicyFingerprint(t *testing.T) {
 		assert.Equal(t, (&IPPolicy{}).fingerprint(), withResolver.fingerprint())
 	})
 }
+
+// TestCredentialEndpointsAreNonExemptible pins the metadata endpoints that sit
+// inside otherwise-exemptible private ranges: EKS Pod Identity lives in
+// 169.254.0.0/16 and Alibaba's ECS metadata in the CGNAT 100.64.0.0/10, so
+// without an explicit entry a broad exception or AllowAllPrivateIPs would
+// reach a credential endpoint the API promises can never be re-enabled.
+func TestCredentialEndpointsAreNonExemptible(t *testing.T) {
+	permissive, err := NewIPPolicy("169.254.0.0/16", "100.64.0.0/10", "0.0.0.0/0", "::/0")
+	require.NoError(t, err)
+
+	policies := map[string]*IPPolicy{
+		"exception covers the range": permissive,
+		"allow all private":          AllowAllPrivateIPs(),
+		"default":                    {},
+	}
+	targets := []string{
+		"http://169.254.170.23/v1/credentials",     // AWS EKS Pod Identity Agent
+		"http://[fd00:ec2::23]/v1/credentials",     // ... over IPv6
+		"http://100.100.100.200/latest/meta-data/", // Alibaba Cloud ECS
+	}
+	for name, policy := range policies {
+		for _, target := range targets {
+			t.Run(name+" "+target, func(t *testing.T) {
+				err := policy.ValidateURL(target)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "cloud metadata")
+			})
+		}
+	}
+
+	// Neighbouring addresses in the same ranges stay exemptible, so the new
+	// entries are /32/128 host routes rather than a widened block.
+	require.NoError(t, permissive.ValidateURL("http://169.254.170.24/"))
+	require.NoError(t, permissive.ValidateURL("http://100.100.100.201/"))
+}
+
+// TestTrailingDotIsPreservedForResolution pins that the FQDN trailing dot is
+// only insignificant for the static blocked-hostname aliases. It selects an
+// absolute lookup, so "host." and "host" are different DNS queries and must
+// not share a resolution path or a cache identity.
+func TestTrailingDotIsPreservedForResolution(t *testing.T) {
+	t.Run("alias matching still ignores the dot", func(t *testing.T) {
+		require.Error(t, ValidateURLNotPrivate("http://localhost./"))
+	})
+
+	t.Run("lookup keeps the dot", func(t *testing.T) {
+		stub := &recordingResolver{addrs: []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}}
+		policy := &IPPolicy{Resolver: stub}
+		require.NoError(t, policy.ValidateURLResolved(context.Background(), "http://Example.COM./"))
+		// Lower-cased (DNS-insignificant) but the dot survives, so the
+		// absolute query is the one actually checked.
+		assert.Equal(t, "example.com.", stub.lastHost)
+	})
+
+	t.Run("dotted and undotted are distinct cache identities", func(t *testing.T) {
+		assert.NotEqual(t, lowerHost("host."), lowerHost("host"))
+	})
+}
+
+type recordingResolver struct {
+	addrs    []net.IPAddr
+	lastHost string
+}
+
+func (r *recordingResolver) LookupIPAddr(_ context.Context, host string) ([]net.IPAddr, error) {
+	r.lastHost = host
+	return r.addrs, nil
+}
+
+// TestAllowedCIDRsWithNilEntryDenies pins that a caller-built policy carrying a
+// nil *net.IPNet -- possible because AllowedCIDRs is a public field -- produces
+// a denial rather than panicking inside a library consumer.
+func TestAllowedCIDRsWithNilEntryDenies(t *testing.T) {
+	_, ten, err := net.ParseCIDR("10.0.0.0/8")
+	require.NoError(t, err)
+	policy := &IPPolicy{AllowedCIDRs: []*net.IPNet{nil, ten}}
+
+	require.NotPanics(t, func() {
+		assert.Error(t, policy.ValidateURL("http://127.0.0.1/"))
+	})
+	// The valid entry alongside the nil one still works.
+	require.NoError(t, policy.ValidateURL("http://10.1.2.3/"))
+}
