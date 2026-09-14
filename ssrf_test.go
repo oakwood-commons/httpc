@@ -6,6 +6,7 @@ package httpc
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -407,4 +408,61 @@ func TestNonDecodablePrefixIsNonExemptible(t *testing.T) {
 			})
 		}
 	}
+}
+
+// TestValidateURLJudgesZonedLiteral pins that a scoped IPv6 literal is judged
+// as the address it is. net.ParseIP rejects the zoned spelling, so without the
+// zone strip the literal falls through as if it were a hostname and is allowed.
+func TestValidateURLJudgesZonedLiteral(t *testing.T) {
+	tests := []struct {
+		name    string
+		policy  *IPPolicy
+		rawURL  string
+		blocked bool
+	}{
+		{"link-local blocked by default", defaultIPPolicy, "http://[fe80::1%25eth0]/", true},
+		{"metadata blocked by default", defaultIPPolicy, "http://[fe80::a9fe%25eth0]/", true},
+		{"allowed when policy permits", mustPolicy(t, "fe80::/10"), "http://[fe80::1%25eth0]/", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.policy.ValidateURL(tt.rawURL)
+			if tt.blocked {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrBlockedByPolicy)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// TestValidateURLResolvedRejectsEmptyResolverResult pins that a resolver
+// answering with no addresses and no error is a failure, not an allow: nothing
+// was checked, so there is no basis for permitting the request.
+func TestValidateURLResolvedRejectsEmptyResolverResult(t *testing.T) {
+	policy := &IPPolicy{Resolver: stubResolver{addrs: nil}}
+
+	err := policy.ValidateURLResolved(context.Background(), "http://example.test/")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no addresses")
+}
+
+// TestValidateURLResolvedSkipsZonedLiteral pins that a scoped literal is not
+// handed to the resolver as though it were a hostname.
+func TestValidateURLResolvedSkipsZonedLiteral(t *testing.T) {
+	var calls atomic.Int64
+	policy := &IPPolicy{AllowPrivate: true, Resolver: countingResolver{count: &calls}}
+
+	require.NoError(t, policy.ValidateURLResolved(context.Background(), "http://[fe80::1%25eth0]/"))
+	assert.Zero(t, calls.Load(), "a scoped literal must not be resolved")
+}
+
+func mustPolicy(t *testing.T, cidrs ...string) *IPPolicy {
+	t.Helper()
+	p, err := NewIPPolicy(cidrs...)
+	require.NoError(t, err)
+	return p
 }

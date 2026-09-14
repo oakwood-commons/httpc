@@ -377,8 +377,10 @@ func (p *IPPolicy) ValidateURL(rawURL string) error {
 		)
 	}
 
-	// Only check IP literals; plain hostnames are enforced at dial time.
-	ip := net.ParseIP(host)
+	// Only check IP literals; plain hostnames are enforced at dial time. The
+	// zone is stripped for parsing so a scoped literal is judged as the IP it
+	// is, rather than falling through as if it were a hostname.
+	ip := net.ParseIP(stripZone(host))
 	if ip == nil {
 		return nil
 	}
@@ -404,7 +406,7 @@ func (p *IPPolicy) ValidateURLResolved(ctx context.Context, rawURL string) error
 		return fmt.Errorf("invalid URL: %w", err)
 	}
 	host := normaliseHost(u.Hostname())
-	if net.ParseIP(host) != nil {
+	if net.ParseIP(stripZone(host)) != nil {
 		return nil // already checked as a literal by ValidateURL
 	}
 
@@ -415,6 +417,11 @@ func (p *IPPolicy) ValidateURLResolved(ctx context.Context, rawURL string) error
 	addrs, err := resolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve host %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		// No addresses and no error means nothing was checked. Returning nil
+		// here would allow the request on the strength of an empty answer.
+		return fmt.Errorf("cannot resolve host %q: resolver returned no addresses", host)
 	}
 	for _, addr := range addrs {
 		if err := p.CheckIP(addr.IP); err != nil {

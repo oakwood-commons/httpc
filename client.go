@@ -310,9 +310,20 @@ func newBaseTransport(config *ClientConfig, policy *IPPolicy, fallback http.Roun
 		return config.Transport
 	}
 
-	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+	// Apply the same dialer-ownership check to the default transport: an
+	// application is free to replace http.DefaultTransport, and one carrying a
+	// TLS dial hook would keep it through policyTransport and bypass the
+	// policy on HTTPS.
+	//nolint:staticcheck // Dial/DialTLS are deprecated but must still be checked
+	if t, ok := http.DefaultTransport.(*http.Transport); ok &&
+		t.DialTLSContext == nil && t.DialTLS == nil {
 		return policyTransport(t, policy, config.Logger)
 	}
+	config.Logger.Info(
+		"httpc: http.DefaultTransport has been replaced with one that installs its own TLS dialer " +
+			"or is not an *http.Transport; dial-time SSRF enforcement is disabled and remains the " +
+			"caller's responsibility",
+	)
 	if fallback != nil {
 		return fallback
 	}

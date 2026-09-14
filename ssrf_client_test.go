@@ -5,6 +5,7 @@ package httpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -217,7 +218,8 @@ func TestAppConfigTrustProxyResolution(t *testing.T) {
 	assert.Nil(t, MergeAppConfig(&AppConfig{}, &AppConfig{}).TrustProxyResolution)
 }
 
-// newFakeProxy returns a server that answers any proxied request itself,// plus the count of requests it saw.
+// newFakeProxy returns a server that answers any proxied request itself, plus
+// the count of requests it saw.
 func newFakeProxy(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	var seen atomic.Int64
@@ -783,4 +785,34 @@ func TestCloseReleasesIdleConnections(t *testing.T) {
 
 	assert.Eventually(t, func() bool { return idle.Load() == 0 }, time.Second, 10*time.Millisecond,
 		"Close should release the client's idle connections")
+}
+
+// TestReplacedDefaultTransportWithTLSHookIsNotWrapped pins that the
+// dialer-ownership check applies to http.DefaultTransport too. An application
+// may replace it, and net/http prefers DialTLSContext over DialContext for
+// non-proxied HTTPS, so wrapping such a transport would leave HTTPS
+// unenforced while looking protected.
+func TestReplacedDefaultTransportWithTLSHookIsNotWrapped(t *testing.T) {
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+
+	replacement := original.(*http.Transport).Clone()
+	replacement.DialTLSContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("unused")
+	}
+	http.DefaultTransport = replacement
+
+	got := newBaseTransport(DefaultConfig(), defaultIPPolicy, nil)
+
+	assert.Same(t, replacement, got, "a TLS-dialing default transport must be used verbatim, not wrapped")
+}
+
+// TestDefaultTransportWithoutTLSHookIsWrapped is the positive counterpart, so
+// the check above cannot pass by rejecting everything.
+func TestDefaultTransportWithoutTLSHookIsWrapped(t *testing.T) {
+	got := newBaseTransport(DefaultConfig(), defaultIPPolicy, nil)
+
+	wrapped, ok := got.(*markingTransport)
+	require.True(t, ok, "expected the default transport to be wrapped, got %T", got)
+	assert.NotSame(t, http.DefaultTransport, wrapped.base)
 }
