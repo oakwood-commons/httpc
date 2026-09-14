@@ -82,9 +82,11 @@ func embeddedIPv4(ip net.IP) net.IP {
 	case nat64WellKnownNet.Contains(ip16): // RFC 6052 well-known prefix, fixed at /96
 		return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
 	case ipv4CompatibleNet.Contains(ip16): // RFC 4291 ::a.b.c.d
-		// Exclude :: and ::1, which are not IPv4-compatible addresses and are
-		// already covered by the blocklist.
-		if ip16[12] == 0 && ip16[13] == 0 && ip16[14] == 0 {
+		// Exclude exactly :: and ::1, which are not IPv4-compatible addresses
+		// and are already covered by the blocklist. Anything else in the
+		// prefix -- ::2 included -- is decoded, so it is judged on the
+		// embedded address rather than slipping past as "not IPv4".
+		if ip16[12] == 0 && ip16[13] == 0 && ip16[14] == 0 && ip16[15] <= 1 {
 			return nil
 		}
 		return net.IPv4(ip16[12], ip16[13], ip16[14], ip16[15])
@@ -250,7 +252,10 @@ func AllowAllPrivateIPs() *IPPolicy {
 
 // CheckIP reports whether the policy permits connecting to ip.
 func (p *IPPolicy) CheckIP(ip net.IP) error {
-	if ip == nil {
+	// net.IP is a byte slice, so "not nil" is not "well formed": an empty or
+	// three-byte value would match no network and fall through to allowed.
+	// Fail closed on anything To16 cannot make sense of.
+	if len(ip) == 0 || ip.To16() == nil {
 		return fmt.Errorf("%w: invalid IP address", ErrBlockedByPolicy)
 	}
 
@@ -415,12 +420,24 @@ func (p *IPPolicy) ControlFunc() func(network, address string, c syscall.RawConn
 			// Address is not host:port; fall back to treating it as a bare host.
 			host = address
 		}
-		ip := net.ParseIP(host)
+		ip := net.ParseIP(stripZone(host))
 		if ip == nil {
 			return fmt.Errorf("%w: refusing to dial unresolvable address %q", ErrBlockedByPolicy, address)
 		}
 		return p.CheckIP(ip)
 	}
+}
+
+// stripZone removes an IPv6 scope-zone suffix ("fe80::1%eth0" -> "fe80::1").
+// net.ParseIP rejects a zoned address, which would otherwise deny a
+// link-local dial even under a policy that explicitly allows fe80::/10. Only
+// the parsed form is stripped; the address handed to the dialer keeps its
+// zone.
+func stripZone(host string) string {
+	if i := strings.LastIndex(host, "%"); i >= 0 {
+		return host[:i]
+	}
+	return host
 }
 
 // ValidateURLNotPrivate returns an error if rawURL uses a scheme other than

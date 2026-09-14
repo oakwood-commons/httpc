@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -554,4 +555,62 @@ func TestTargetVerdictCacheReusesDeterministicVerdicts(t *testing.T) {
 	// Once the TTL lapses the verdict is recomputed.
 	require.ErrorIs(t, cache.check("blocked.test", now.Add(2*proxiedTargetTTL), blocked), ErrBlockedByPolicy)
 	assert.Equal(t, 2, calls)
+}
+
+// TestTargetVerdictCacheStaysBoundedUnderConcurrency pins that admission is
+// serialised: a burst of distinct hosts must not race past the cap.
+func TestTargetVerdictCacheStaysBoundedUnderConcurrency(t *testing.T) {
+	cache := &targetVerdictCache{}
+	now := time.Now()
+
+	var wg sync.WaitGroup
+	for i := range maxProxiedTargetEntries * 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = cache.check(fmt.Sprintf("burst-%d.test", i), now, func() error { return nil })
+		}()
+	}
+	wg.Wait()
+
+	assert.LessOrEqual(t, cache.size.Load(), int64(maxProxiedTargetEntries),
+		"cache grew past its cap under concurrent admission")
+}
+
+func TestCheckIPFailsClosedOnMalformedAddress(t *testing.T) {
+	policy := AllowAllPrivateIPs()
+	for name, ip := range map[string]net.IP{
+		"nil":        nil,
+		"empty":      {},
+		"three byte": {1, 2, 3},
+		"five byte":  {1, 2, 3, 4, 5},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := policy.CheckIP(ip)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrBlockedByPolicy)
+		})
+	}
+}
+
+// TestIPv4CompatibleDecodesAllButUnspecifiedAndLoopback pins that the
+// exclusion covers exactly :: and ::1, so ::2 is judged as 0.0.0.2 -- which
+// 0.0.0.0/8 blocks.
+func TestIPv4CompatibleDecodesAllButUnspecifiedAndLoopback(t *testing.T) {
+	assert.Nil(t, embeddedIPv4(net.ParseIP("::")))
+	assert.Nil(t, embeddedIPv4(net.ParseIP("::1")))
+
+	require.Equal(t, net.IPv4(0, 0, 0, 2).String(), embeddedIPv4(net.ParseIP("::2")).String())
+	assert.Error(t, defaultIPPolicy.CheckIP(net.ParseIP("::2")))
+}
+
+// TestControlFuncStripsIPv6Zone pins that a scoped link-local address is
+// judged on its address, not denied for carrying a zone.
+func TestControlFuncStripsIPv6Zone(t *testing.T) {
+	policy, err := NewIPPolicy("fe80::/10")
+	require.NoError(t, err)
+	assert.NoError(t, policy.ControlFunc()("tcp6", "[fe80::1%eth0]:80", nil))
+
+	// The zone must not launder a blocked address either.
+	assert.Error(t, defaultIPPolicy.ControlFunc()("tcp6", "[fe80::1%eth0]:80", nil))
 }

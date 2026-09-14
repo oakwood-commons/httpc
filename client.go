@@ -391,6 +391,12 @@ const maxProxiedTargetEntries = 1024
 type targetVerdictCache struct {
 	entries sync.Map // normalised host -> *targetVerdict
 	size    atomic.Int64
+	// admit serialises the cap check, eviction and insertion. Without it each
+	// goroutine in a burst of new hosts can observe the size below the cap
+	// before inserting, so the cache grows past its bound -- exactly the case
+	// the bound exists for (attacker-influenced hostnames). Reads above still
+	// run lock-free.
+	admit sync.Mutex
 }
 
 type targetVerdict struct {
@@ -415,6 +421,9 @@ func (c *targetVerdictCache) check(host string, now time.Time, validate func() e
 		return err
 	}
 
+	c.admit.Lock()
+	defer c.admit.Unlock()
+
 	c.evictIfFull(now)
 	if _, loaded := c.entries.Swap(host, &targetVerdict{err: err, expires: now.Add(proxiedTargetTTL)}); !loaded {
 		c.size.Add(1)
@@ -423,7 +432,7 @@ func (c *targetVerdictCache) check(host string, now time.Time, validate func() e
 }
 
 // evictIfFull drops expired entries once the cache reaches its cap, and clears
-// it outright if that did not free anything.
+// it outright if that did not free anything. Callers must hold c.admit.
 func (c *targetVerdictCache) evictIfFull(now time.Time) {
 	if c.size.Load() < maxProxiedTargetEntries {
 		return
