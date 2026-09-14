@@ -286,12 +286,22 @@ config.IPPolicy = httpc.AllowAllPrivateIPs()
 `config.AllowPrivateIPs = true` is the deprecated equivalent, kept for
 backwards compatibility and ignored when `IPPolicy` is set.
 
-A caller-supplied `ClientConfig.Transport` only gets dial-time enforcement if it
-is an `*http.Transport` without its own dialer; otherwise it is used verbatim, a
-warning is logged, and securing it is the caller's responsibility. Note that
-this includes passing `http.DefaultTransport` explicitly -- it has its own
-dialer, so it is used as-is, whereas leaving `Transport` nil clones it and wires
-the policy in.
+A caller-supplied `ClientConfig.Transport` is enforced too. Setting a policy is
+an explicit request, so httpc does not quietly decline it:
+
+- An `*http.Transport` with no dialer of its own gets the policy on its dialer's
+  `Control` hook, which refuses before a connection exists.
+- An `*http.Transport` that brings its own dialer (including a TLS dial hook)
+  keeps it -- you set it for a reason -- and the address it actually connected
+  to is checked immediately afterwards, with the connection closed if the policy
+  denies it. No HTTP request is sent to a denied address. This is marginally
+  weaker than `Control` only in that the TCP connection is established first;
+  it still judges the real peer address, so a hostname or a rebind cannot fool
+  it.
+- A `Transport` that is not an `*http.Transport` has no dialer to hook. It falls
+  back to validating each request URL, resolving the hostname first. That check
+  races DNS, so it is genuinely weaker; a warning says so. For full enforcement,
+  install `policy.ControlFunc()` as the `Control` hook of your own `net.Dialer`.
 
 #### Caching
 

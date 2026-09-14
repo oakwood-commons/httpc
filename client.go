@@ -300,45 +300,72 @@ func (c *ClientConfig) ipPolicy() *IPPolicy {
 // request that selected a proxy are therefore exempt from the policy, and the
 // target is validated (resolving the hostname) in the Proxy hook instead.
 //
-// A caller-supplied transport is only instrumented when it is an
-// *http.Transport that does not already install its own dialer -- plain
-// (DialContext/Dial) or TLS (DialTLSContext/DialTLS). A TLS hook counts,
-// because net/http prefers it over DialContext for non-proxied HTTPS, so a
-// transport carrying one would silently bypass the policy. Anything else is
-// used verbatim, and a warning is logged so the downgrade is visible.
+// A caller-supplied transport keeps whatever dialer it has; the policy is
+// applied to the address that dialer actually reaches. A transport that is not
+// an *http.Transport has no dialer to instrument, so it falls back to
+// validating each request URL, which is weaker and says so.
 func newBaseTransport(config *ClientConfig, policy *IPPolicy, fallback http.RoundTripper) http.RoundTripper {
 	if config.Transport != nil {
-		t, ok := config.Transport.(*http.Transport)
-		//nolint:staticcheck // Dial/DialTLS are deprecated but must still be checked
-		if ok && t.DialContext == nil && t.Dial == nil &&
-			t.DialTLSContext == nil && t.DialTLS == nil {
+		if t, ok := config.Transport.(*http.Transport); ok {
 			return policyTransport(t, policy, config.Logger)
 		}
-		config.Logger.Info(
-			"httpc: custom Transport installs its own dialer or is not an *http.Transport; " +
-				"dial-time SSRF enforcement is disabled for it and remains the caller's responsibility",
-		)
-		return config.Transport
+
+		// No dialer exists to hook, so enforcement drops to URL validation,
+		// which resolves the hostname itself and is therefore TOCTOU-prone.
+		if config.Logger.GetSink() != nil {
+			config.Logger.Info(
+				"httpc: custom Transport is not an *http.Transport, so the IP policy cannot be " +
+					"enforced at dial time; falling back to URL validation. For full enforcement, " +
+					"install policy.ControlFunc() as the Control hook of your own net.Dialer",
+			)
+		}
+		return newURLPolicyTransport(config.Transport, policy)
 	}
 
-	// Apply the same dialer-ownership check to the default transport: an
-	// application is free to replace http.DefaultTransport, and one carrying a
-	// TLS dial hook would keep it through policyTransport and bypass the
-	// policy on HTTPS.
-	//nolint:staticcheck // Dial/DialTLS are deprecated but must still be checked
-	if t, ok := http.DefaultTransport.(*http.Transport); ok &&
-		t.DialTLSContext == nil && t.DialTLS == nil {
+	// An application may have replaced http.DefaultTransport; whatever dialers
+	// it carries are wrapped like any caller-supplied transport's.
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		return policyTransport(t, policy, config.Logger)
 	}
-	config.Logger.Info(
-		"httpc: http.DefaultTransport has been replaced with one that installs its own TLS dialer " +
-			"or is not an *http.Transport; dial-time SSRF enforcement is disabled and remains the " +
-			"caller's responsibility",
-	)
-	if fallback != nil {
-		return fallback
+
+	if config.Logger.GetSink() != nil {
+		config.Logger.Info(
+			"httpc: http.DefaultTransport has been replaced with something that is not an " +
+				"*http.Transport, so the IP policy cannot be enforced at dial time; falling back " +
+				"to URL validation",
+		)
 	}
-	return http.DefaultTransport
+	if fallback != nil {
+		return newURLPolicyTransport(fallback, policy)
+	}
+	return newURLPolicyTransport(http.DefaultTransport, policy)
+}
+
+// urlPolicyTransport validates each request URL against the policy, resolving
+// the hostname. It is the last resort for a transport with no dialer to hook:
+// unlike the dial-time check it races DNS, so the address validated is not
+// guaranteed to be the one connected to. It is still far better than passing
+// an explicitly configured policy through unenforced.
+type urlPolicyTransport struct {
+	base   http.RoundTripper
+	policy *IPPolicy
+}
+
+func newURLPolicyTransport(base http.RoundTripper, policy *IPPolicy) http.RoundTripper {
+	return &urlPolicyTransport{base: base, policy: policy}
+}
+
+func (u *urlPolicyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := u.policy.ValidateURLResolved(req.Context(), req.URL.String()); err != nil {
+		return nil, err
+	}
+	return u.base.RoundTrip(req)
+}
+
+func (u *urlPolicyTransport) CloseIdleConnections() {
+	if c, ok := u.base.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
 }
 
 // proxyMarker records, for a single request, whether the transport selected a
@@ -391,17 +418,115 @@ func policyTransport(t *http.Transport, policy *IPPolicy, logger logr.Logger) ht
 		KeepAlive: defaultDialKeepAlive,
 	}
 
+	// A caller who supplied their own dialer (for timeouts, mTLS, a custom
+	// resolver) keeps it: their dialer runs, and the address it actually
+	// connected to is judged afterwards. That is weaker than Control, which
+	// refuses before the connection exists, but it is not weaker in the way
+	// that matters -- it judges the real peer address, so it cannot be fooled
+	// by a hostname or a rebind, and no HTTP request is ever sent to a denied
+	// address. Declining to enforce at all would be the worse trade.
+	//nolint:staticcheck // Dial/DialTLS are deprecated but callers may still set them
+	callerDial, callerDialTLS := clone.DialContext, clone.DialTLSContext
+	if callerDial == nil && clone.Dial != nil {
+		legacy := clone.Dial
+		callerDial = func(_ context.Context, network, addr string) (net.Conn, error) {
+			return legacy(network, addr)
+		}
+	}
+	if callerDialTLS == nil && clone.DialTLS != nil {
+		legacy := clone.DialTLS
+		callerDialTLS = func(_ context.Context, network, addr string) (net.Conn, error) {
+			return legacy(network, addr)
+		}
+	}
+
 	clone.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		// Exemption is scoped to the single request whose Proxy hook set the
 		// marker, so an address that merely happens to equal some proxy's
 		// cannot launder a direct request past the policy.
+		proxied := false
 		if marker, ok := ctx.Value(proxyMarkerKey).(*proxyMarker); ok && marker.proxied.Load() {
+			proxied = true
+		}
+
+		if callerDial != nil {
+			conn, err := callerDial(ctx, network, addr)
+			if err != nil || proxied {
+				return conn, err
+			}
+			return checkDialedConn(conn, policy)
+		}
+
+		if proxied {
 			return plain.DialContext(ctx, network, addr)
 		}
 		return enforcing.DialContext(ctx, network, addr)
 	}
 
+	// net/http prefers a TLS dial hook over DialContext for non-proxied HTTPS,
+	// so an unchecked one would bypass everything above on exactly the
+	// requests most worth protecting.
+	if callerDialTLS != nil {
+		clone.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := callerDialTLS(ctx, network, addr)
+			if err != nil {
+				return conn, err
+			}
+			if marker, ok := ctx.Value(proxyMarkerKey).(*proxyMarker); ok && marker.proxied.Load() {
+				return conn, nil
+			}
+			return checkDialedConn(conn, policy)
+		}
+	}
+
+	//nolint:staticcheck // superseded by the context-aware hooks installed above
+	clone.Dial, clone.DialTLS = nil, nil
+
 	return &markingTransport{base: clone}
+}
+
+// checkDialedConn judges the address a caller-owned dialer actually connected
+// to, closing the connection if the policy denies it. Used where Control is
+// unavailable because the dialer belongs to the caller.
+func checkDialedConn(conn net.Conn, policy *IPPolicy) (net.Conn, error) {
+	if conn == nil {
+		return nil, fmt.Errorf("%w: dialer returned no connection and no error", ErrBlockedByPolicy)
+	}
+
+	ip := remoteIP(conn)
+	if ip == nil {
+		// Fail closed: an address we cannot read is one we cannot clear.
+		_ = conn.Close()
+		return nil, fmt.Errorf(
+			"%w: cannot determine the address dialed (%v), so it cannot be checked",
+			ErrBlockedByPolicy, conn.RemoteAddr(),
+		)
+	}
+
+	if err := policy.CheckIP(ip); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// remoteIP extracts the peer IP of a connection, or nil if it has none (a
+// Unix socket, or a net.Conn implementation with an address we cannot parse).
+func remoteIP(conn net.Conn) net.IP {
+	switch addr := conn.RemoteAddr().(type) {
+	case *net.TCPAddr:
+		return addr.IP
+	case *net.UDPAddr:
+		return addr.IP
+	case *net.IPAddr:
+		return addr.IP
+	}
+
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		return nil
+	}
+	return net.ParseIP(host)
 }
 
 // The Proxy hook runs on every round trip, including ones served from an idle

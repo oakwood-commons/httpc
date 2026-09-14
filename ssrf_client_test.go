@@ -5,6 +5,7 @@ package httpc
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -275,40 +276,6 @@ func TestClientBlocksPrivateTargetThroughProxy(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cloud metadata")
 	assert.Equal(t, int64(0), seen.Load(), "proxy must not be contacted for a blocked target")
-}
-
-func TestCustomTransportWithOwnDialerIsUsedVerbatim(t *testing.T) {
-	custom := &http.Transport{
-		DialContext: (&net.Dialer{}).DialContext,
-	}
-	cfg := ssrfTestConfig()
-	cfg.Transport = custom
-
-	got := newBaseTransport(cfg, defaultIPPolicy, nil)
-	assert.Same(t, custom, got, "a transport with its own dialer must not be silently rewrapped")
-}
-
-func TestCustomTransportWithTLSDialHookIsUsedVerbatim(t *testing.T) {
-	// net/http prefers DialTLSContext over DialContext for non-proxied HTTPS,
-	// so wrapping such a transport would advertise enforcement it cannot do.
-	tlsCtx := &http.Transport{
-		DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
-			return nil, fmt.Errorf("unused")
-		},
-	}
-	cfg := ssrfTestConfig()
-	cfg.Transport = tlsCtx
-	assert.Same(t, tlsCtx, newBaseTransport(cfg, defaultIPPolicy, nil))
-
-	//nolint:staticcheck // DialTLS is deprecated but still honoured by net/http
-	tlsLegacy := &http.Transport{
-		DialTLS: func(string, string) (net.Conn, error) {
-			return nil, fmt.Errorf("unused")
-		},
-	}
-	cfg2 := ssrfTestConfig()
-	cfg2.Transport = tlsLegacy
-	assert.Same(t, tlsLegacy, newBaseTransport(cfg2, defaultIPPolicy, nil))
 }
 
 func TestNewBaseTransportDoesNotMutateDefaultTransport(t *testing.T) {
@@ -802,26 +769,6 @@ func TestCloseReleasesIdleConnections(t *testing.T) {
 		"Close should release the client's idle connections")
 }
 
-// TestReplacedDefaultTransportWithTLSHookIsNotWrapped pins that the
-// dialer-ownership check applies to http.DefaultTransport too. An application
-// may replace it, and net/http prefers DialTLSContext over DialContext for
-// non-proxied HTTPS, so wrapping such a transport would leave HTTPS
-// unenforced while looking protected.
-func TestReplacedDefaultTransportWithTLSHookIsNotWrapped(t *testing.T) {
-	original := http.DefaultTransport
-	t.Cleanup(func() { http.DefaultTransport = original })
-
-	replacement := original.(*http.Transport).Clone()
-	replacement.DialTLSContext = func(context.Context, string, string) (net.Conn, error) {
-		return nil, errors.New("unused")
-	}
-	http.DefaultTransport = replacement
-
-	got := newBaseTransport(DefaultConfig(), defaultIPPolicy, nil)
-
-	assert.Same(t, replacement, got, "a TLS-dialing default transport must be used verbatim, not wrapped")
-}
-
 // TestDefaultTransportWithoutTLSHookIsWrapped is the positive counterpart, so
 // the check above cannot pass by rejecting everything.
 func TestDefaultTransportWithoutTLSHookIsWrapped(t *testing.T) {
@@ -921,4 +868,128 @@ func TestCloseClosesOwnedTransport(t *testing.T) {
 	require.True(t, ok, "expected a client-owned transport, got %T", client.idleCloser)
 	require.NotNil(t, owned)
 	require.NoError(t, client.Close())
+}
+
+// TestCustomDialerIsUsedAndItsAddressChecked pins that a caller's own dialer
+// still runs -- they set it for a reason -- while the address it reaches is
+// judged. Control cannot be installed on someone else's dialer, so the check
+// happens after connect; no HTTP request is sent to a denied address.
+func TestCustomDialerIsUsedAndItsAddressChecked(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	var dialerUsed atomic.Int64
+	cfg := ssrfTestConfig()
+	cfg.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialerUsed.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
+
+	resp, err := NewClient(cfg).StandardClient().Get(server.URL) //nolint:noctx // exercising the dialer
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+
+	require.Error(t, err, "a loopback address must be refused even behind a custom dialer")
+	assert.Contains(t, err.Error(), "private/reserved")
+	assert.Positive(t, dialerUsed.Load(), "the caller's dialer must still be the one used")
+}
+
+// TestCustomDialerAllowedByPolicyConnects is the positive counterpart, so the
+// check above cannot pass by refusing everything.
+func TestCustomDialerAllowedByPolicyConnects(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	var dialerUsed atomic.Int64
+	cfg := ssrfTestConfig()
+	cfg.IPPolicy = mustPolicy(t, "127.0.0.0/8", "::1/128")
+	cfg.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialerUsed.Add(1)
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}
+
+	resp, err := NewClient(cfg).StandardClient().Get(server.URL) //nolint:noctx // exercising the dialer
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Positive(t, dialerUsed.Load())
+}
+
+// TestCustomTLSDialHookIsChecked covers the hook net/http prefers over
+// DialContext for non-proxied HTTPS, which is where an unchecked dialer would
+// do the most damage.
+func TestCustomTLSDialHookIsChecked(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	var dialerUsed atomic.Int64
+	cfg := ssrfTestConfig()
+	cfg.Transport = &http.Transport{
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialerUsed.Add(1)
+			return tls.Dial(network, addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test server
+		},
+	}
+
+	resp, err := NewClient(cfg).StandardClient().Get(server.URL) //nolint:noctx // exercising the dialer
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+
+	require.Error(t, err, "a TLS dial hook must not bypass the policy")
+	assert.Contains(t, err.Error(), "private/reserved")
+	assert.Positive(t, dialerUsed.Load())
+}
+
+// TestNonHTTPTransportFallsBackToURLValidation pins that a RoundTripper with
+// no dialer to hook still gets the policy applied, rather than an explicitly
+// configured policy being silently dropped.
+func TestNonHTTPTransportFallsBackToURLValidation(t *testing.T) {
+	var reached atomic.Int64
+	cfg := ssrfTestConfig()
+	cfg.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		reached.Add(1)
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	})
+
+	resp, err := NewClient(cfg).StandardClient().Get("http://127.0.0.1:9/") //nolint:noctx // exercising the transport
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "private/reserved")
+	assert.Zero(t, reached.Load(), "the request must not reach a transport we cannot instrument")
+}
+
+// TestReplacedDefaultTransportWithTLSHookIsWrapped pins that a replaced
+// http.DefaultTransport is instrumented like any other, rather than passed
+// through because it carries a TLS dial hook.
+func TestReplacedDefaultTransportWithTLSHookIsWrapped(t *testing.T) {
+	original := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = original })
+
+	replacement := original.(*http.Transport).Clone()
+	replacement.DialTLSContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("unused")
+	}
+	http.DefaultTransport = replacement
+
+	got := newBaseTransport(DefaultConfig(), defaultIPPolicy, nil)
+
+	wrapped, ok := got.(*markingTransport)
+	require.True(t, ok, "a replaced default transport must still be instrumented, got %T", got)
+	assert.NotSame(t, replacement, wrapped.base)
 }
