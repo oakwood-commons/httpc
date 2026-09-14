@@ -816,3 +816,55 @@ func TestDefaultTransportWithoutTLSHookIsWrapped(t *testing.T) {
 	require.True(t, ok, "expected the default transport to be wrapped, got %T", got)
 	assert.NotSame(t, http.DefaultTransport, wrapped.base)
 }
+
+// TestCacheIsNotSharedAcrossPolicies reproduces an SSRF bypass through the
+// cache layer. The cache sits above the transport, so a hit returns without
+// the URL check or the dial hook running. Two clients sharing a CacheDir used
+// to share entries, letting a restrictive client read a response a permissive
+// one had fetched from an address the restrictive policy forbids.
+func TestCacheIsNotSharedAcrossPolicies(t *testing.T) {
+	var serverHits atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		serverHits.Add(1)
+		w.Header().Set("Cache-Control", "max-age=3600")
+		_, _ = w.Write([]byte("INTERNAL"))
+	}))
+	defer server.Close()
+
+	cacheDir := t.TempDir()
+
+	cachedConfig := func(policy *IPPolicy) *ClientConfig {
+		cfg := ssrfTestConfig()
+		cfg.IPPolicy = policy
+		cfg.EnableCache = true
+		cfg.CacheType = CacheTypeFilesystem
+		cfg.CacheDir = cacheDir
+		return cfg
+	}
+
+	// A permissive client populates the shared cache directory.
+	permissive := NewClient(cachedConfig(mustPolicy(t, "127.0.0.0/8", "::1/128")))
+	defer func() { _ = permissive.Close() }()
+
+	resp, err := permissive.Get(context.Background(), server.URL)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, int64(1), serverHits.Load())
+
+	// A restrictive client on the same directory must not be served that entry.
+	// StandardClient bypasses Client.Do, so URL validation never runs and only
+	// the dial hook can refuse -- which a cache hit would skip entirely.
+	restrictive := NewClient(cachedConfig(nil))
+	defer func() { _ = restrictive.Close() }()
+
+	blocked, err := restrictive.StandardClient().Get(server.URL) //nolint:noctx // exercising the cache/dial path
+	if blocked != nil {
+		_ = blocked.Body.Close()
+	}
+	require.Error(t, err, "a restrictive client must not read the permissive client's cached response")
+	assert.Contains(t, err.Error(), "private/reserved")
+	assert.Equal(t, int64(1), serverHits.Load(), "the blocked request must not reach the server either")
+}

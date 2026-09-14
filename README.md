@@ -281,6 +281,17 @@ this includes passing `http.DefaultTransport` explicitly -- it has its own
 dialer, so it is used as-is, whereas leaving `Transport` nil clones it and wires
 the policy in.
 
+#### Caching
+
+The response cache sits above the transport, so a cache hit is returned
+without the dial-time check running. Cache keys therefore include a digest of
+the IP policy: clients sharing a `CacheDir` but configured with different
+policies do not share entries, and a restrictive client is never served a
+response a permissive one fetched.
+
+A consequence worth knowing: changing the policy invalidates that client's
+cached entries, since the key changes with it.
+
 #### Proxies
 
 When a request goes through a proxy, the client dials the proxy rather than the

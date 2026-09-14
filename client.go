@@ -183,7 +183,7 @@ func NewClient(config *ClientConfig) *Client {
 	}
 
 	retryClient, idleCloser := newRetryClient(config, m)
-	httpClient, cache := setupTransport(retryClient, config, m)
+	httpClient, cache := setupTransport(retryClient, config, config.ipPolicy(), m)
 
 	// Initialize circuit breaker if enabled
 	var cb *circuitBreaker
@@ -543,7 +543,14 @@ func (m *markingTransport) CloseIdleConnections() {
 }
 
 // newCache creates the cache backend based on config.CacheType.
-func newCache(config *ClientConfig, m Metrics) httpcache.Cache {
+// newCache builds the response cache. The key prefix carries a digest of the
+// IP policy: the cache sits above the transport, so a hit is returned without
+// the URL check or the dial hook running. Without this, two clients sharing a
+// CacheDir but running different policies would serve each other's entries,
+// and a restrictive client could read a response a permissive one fetched
+// from an address its own policy forbids.
+func newCache(config *ClientConfig, policy *IPPolicy, m Metrics) httpcache.Cache {
+	keyPrefix := config.CacheKeyPrefix + "-" + policy.fingerprint()
 	switch config.CacheType {
 	case CacheTypeFilesystem:
 		cacheDir := config.CacheDir
@@ -553,7 +560,7 @@ func newCache(config *ClientConfig, m Metrics) httpcache.Cache {
 		fileCacheConfig := &FileCacheConfig{
 			Dir:       cacheDir,
 			TTL:       config.CacheTTL,
-			KeyPrefix: config.CacheKeyPrefix,
+			KeyPrefix: keyPrefix,
 			MaxSize:   config.MaxCacheFileSize,
 			Logger:    config.Logger,
 			Metrics:   m,
@@ -597,9 +604,9 @@ func wrapTransport(baseTransport http.RoundTripper, config *ClientConfig, m Metr
 
 // setupTransport configures the transport chain (metrics, compression, cache) on
 // retryClient and returns the final *http.Client plus the cache backend (or nil).
-func setupTransport(retryClient *retryablehttp.Client, config *ClientConfig, m Metrics) (*http.Client, httpcache.Cache) {
+func setupTransport(retryClient *retryablehttp.Client, config *ClientConfig, policy *IPPolicy, m Metrics) (*http.Client, httpcache.Cache) {
 	if config.EnableCache {
-		cache := newCache(config, m)
+		cache := newCache(config, policy, m)
 
 		finalTransport := wrapTransport(retryClient.HTTPClient.Transport, config, m)
 

@@ -466,3 +466,48 @@ func mustPolicy(t *testing.T, cidrs ...string) *IPPolicy {
 	require.NoError(t, err)
 	return p
 }
+
+// TestIPPolicyFingerprint pins that the digest separates policies that decide
+// differently and unites ones that decide identically. Cache keys are built
+// from it, so a collision leaks entries across policies and a spurious
+// difference silently halves the hit rate.
+func TestIPPolicyFingerprint(t *testing.T) {
+	base := mustPolicy(t, "10.0.0.0/8")
+
+	t.Run("stable across calls", func(t *testing.T) {
+		assert.Equal(t, base.fingerprint(), base.fingerprint())
+	})
+
+	t.Run("independent of CIDR order", func(t *testing.T) {
+		a := mustPolicy(t, "10.0.0.0/8", "192.168.0.0/16")
+		b := mustPolicy(t, "192.168.0.0/16", "10.0.0.0/8")
+		assert.Equal(t, a.fingerprint(), b.fingerprint())
+	})
+
+	t.Run("differs from a different range", func(t *testing.T) {
+		assert.NotEqual(t, base.fingerprint(), mustPolicy(t, "172.16.0.0/12").fingerprint())
+	})
+
+	t.Run("differs from the default policy", func(t *testing.T) {
+		assert.NotEqual(t, base.fingerprint(), defaultIPPolicy.fingerprint())
+	})
+
+	t.Run("differs when private access differs", func(t *testing.T) {
+		assert.NotEqual(t, defaultIPPolicy.fingerprint(), AllowAllPrivateIPs().fingerprint())
+	})
+
+	t.Run("differs when proxy trust differs", func(t *testing.T) {
+		trusting := &IPPolicy{TrustProxyResolution: true}
+		assert.NotEqual(t, (&IPPolicy{}).fingerprint(), trusting.fingerprint())
+	})
+
+	t.Run("nil differs from zero value", func(t *testing.T) {
+		var nilPolicy *IPPolicy
+		assert.NotEqual(t, nilPolicy.fingerprint(), (&IPPolicy{}).fingerprint())
+	})
+
+	t.Run("ignores the resolver", func(t *testing.T) {
+		withResolver := &IPPolicy{Resolver: stubResolver{}}
+		assert.Equal(t, (&IPPolicy{}).fingerprint(), withResolver.fingerprint())
+	})
+}

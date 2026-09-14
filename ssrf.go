@@ -5,11 +5,15 @@ package httpc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 )
@@ -429,6 +433,42 @@ func (p *IPPolicy) ValidateURLResolved(ctx context.Context, rawURL string) error
 		}
 	}
 	return nil
+}
+
+// fingerprint returns a short, stable digest of the policy's decision-making
+// fields. Cached responses are keyed on it so an entry fetched under one
+// policy is never served to a client running a stricter one: the cache sits
+// above the transport, so a hit returns without any policy check having run.
+//
+// Only fields that change a verdict are included. Resolver is deliberately
+// excluded -- it is a function value with no stable identity, and it affects
+// how a target is resolved rather than which addresses are permitted.
+func (p *IPPolicy) fingerprint() string {
+	h := sha256.New()
+	if p == nil {
+		// Distinct from a zero-valued policy, which denies rather than
+		// deferring to the package default.
+		_, _ = io.WriteString(h, "nil")
+		return hex.EncodeToString(h.Sum(nil))[:16]
+	}
+
+	fmt.Fprintf(h, "allowPrivate=%t;trustProxyResolution=%t;", p.AllowPrivate, p.TrustProxyResolution)
+
+	// Sort so two policies built from the same ranges in a different order
+	// share a key rather than silently halving the cache hit rate.
+	cidrs := make([]string, 0, len(p.AllowedCIDRs))
+	for _, n := range p.AllowedCIDRs {
+		if n == nil {
+			continue
+		}
+		cidrs = append(cidrs, n.String())
+	}
+	sort.Strings(cidrs)
+	for _, c := range cidrs {
+		fmt.Fprintf(h, "cidr=%s;", c)
+	}
+
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 // ControlFunc returns a net.Dialer.Control function that enforces the policy
