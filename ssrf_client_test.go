@@ -940,7 +940,7 @@ func TestUnixSocketDialerIsNotDeniedByIPPolicy(t *testing.T) {
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
 	socket := filepath.Join(dir, "agent.sock")
-	listener, err := net.Listen("unix", socket)
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", socket)
 	require.NoError(t, err)
 
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
