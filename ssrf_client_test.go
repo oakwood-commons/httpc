@@ -939,7 +939,8 @@ func TestCustomTLSDialHookIsChecked(t *testing.T) {
 	cfg.Transport = &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dialerUsed.Add(1)
-			return tls.Dial(network, addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test server
+			d := &tls.Dialer{Config: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // test server
+			return d.DialContext(ctx, network, addr)
 		},
 	}
 

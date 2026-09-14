@@ -425,16 +425,15 @@ func policyTransport(t *http.Transport, policy *IPPolicy, logger logr.Logger) ht
 	// that matters -- it judges the real peer address, so it cannot be fooled
 	// by a hostname or a rebind, and no HTTP request is ever sent to a denied
 	// address. Declining to enforce at all would be the worse trade.
-	//nolint:staticcheck // Dial/DialTLS are deprecated but callers may still set them
 	callerDial, callerDialTLS := clone.DialContext, clone.DialTLSContext
-	if callerDial == nil && clone.Dial != nil {
-		legacy := clone.Dial
+	//nolint:staticcheck // deprecated, but a caller may still have set it and it must not be ignored
+	if legacy := clone.Dial; callerDial == nil && legacy != nil {
 		callerDial = func(_ context.Context, network, addr string) (net.Conn, error) {
 			return legacy(network, addr)
 		}
 	}
-	if callerDialTLS == nil && clone.DialTLS != nil {
-		legacy := clone.DialTLS
+	//nolint:staticcheck // deprecated, but a caller may still have set it and it must not be ignored
+	if legacy := clone.DialTLS; callerDialTLS == nil && legacy != nil {
 		callerDialTLS = func(_ context.Context, network, addr string) (net.Conn, error) {
 			return legacy(network, addr)
 		}
