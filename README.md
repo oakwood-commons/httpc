@@ -297,7 +297,13 @@ an explicit request, so httpc does not quietly decline it:
   denies it. No HTTP request is sent to a denied address. This is marginally
   weaker than `Control` only in that the TCP connection is established first;
   it still judges the real peer address, so a hostname or a rebind cannot fool
-  it.
+  it. Because the connection completes before the verdict, a caller can tell a
+  refused connection from a denied one and so learn whether an internal port is
+  open; that is inherent to the dialer being yours, and affects only this path.
+- A dialer that connects to a **Unix socket** is left alone. An IP policy has
+  no address to permit or refuse there, and the socket path comes from your
+  dialer rather than the request URL, so a local daemon (Docker, containerd, an
+  agent) keeps working under any policy.
 - A `Transport` that is not an `*http.Transport` has no dialer to hook. It falls
   back to validating each request URL, resolving the hostname first. That check
   races DNS, so it is genuinely weaker; a warning says so. For full enforcement,

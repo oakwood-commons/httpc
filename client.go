@@ -487,9 +487,27 @@ func policyTransport(t *http.Transport, policy *IPPolicy, logger logr.Logger) ht
 // checkDialedConn judges the address a caller-owned dialer actually connected
 // to, closing the connection if the policy denies it. Used where Control is
 // unavailable because the dialer belongs to the caller.
+//
+// Unlike Control, this runs after the connection is established, so a denied
+// destination is connected to and immediately closed rather than never dialed.
+// No HTTP request is ever sent to it, but a caller can still distinguish
+// "connection refused" from "connected, then denied", which reveals whether an
+// internal port is open. That is unavoidable once the dialer belongs to the
+// caller -- the policy only gets to see an address the caller's dialer has
+// already reached -- and it affects only this opt-in path.
 func checkDialedConn(conn net.Conn, policy *IPPolicy) (net.Conn, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("%w: dialer returned no connection and no error", ErrBlockedByPolicy)
+	}
+
+	// A non-IP destination is outside an IP policy's jurisdiction entirely.
+	// A Unix socket has no address to permit or refuse, and the caller's own
+	// dialer chose it -- a request URL cannot redirect a dial to a different
+	// socket path -- so there is no decision here to withhold. This is
+	// distinct from the unreadable-address case below, where an IP *is* being
+	// connected to and simply cannot be judged.
+	if _, ok := conn.RemoteAddr().(*net.UnixAddr); ok {
+		return conn, nil
 	}
 
 	ip := remoteIP(conn)
@@ -509,8 +527,10 @@ func checkDialedConn(conn net.Conn, policy *IPPolicy) (net.Conn, error) {
 	return conn, nil
 }
 
-// remoteIP extracts the peer IP of a connection, or nil if it has none (a
-// Unix socket, or a net.Conn implementation with an address we cannot parse).
+// remoteIP extracts the peer IP of a connection, or nil if its address cannot
+// be parsed as one. Callers must treat nil as "unjudgeable" and fail closed;
+// non-IP destinations that are legitimately outside the policy (Unix sockets)
+// are recognised before this is reached.
 func remoteIP(conn net.Conn) net.IP {
 	switch addr := conn.RemoteAddr().(type) {
 	case *net.TCPAddr:

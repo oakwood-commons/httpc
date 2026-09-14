@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -923,6 +925,68 @@ func TestCustomDialerAllowedByPolicyConnects(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Positive(t, dialerUsed.Load())
+}
+
+// TestUnixSocketDialerIsNotDeniedByIPPolicy pins that a caller dialing a Unix
+// socket -- a Docker or containerd daemon, a local agent -- is left alone. The
+// policy has no jurisdiction over a filesystem path, and the socket is chosen
+// by the caller's dialer, not by the request URL. The strictest policy is used
+// deliberately: nothing here is exempted, the destination is simply not an IP.
+func TestUnixSocketDialerIsNotDeniedByIPPolicy(t *testing.T) {
+	// Not t.TempDir: its path embeds the test name, which overruns the ~104
+	// byte limit on a Unix socket path.
+	dir, err := os.MkdirTemp("", "httpc")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	socket := filepath.Join(dir, "agent.sock")
+	listener, err := net.Listen("unix", socket)
+	require.NoError(t, err)
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	cfg := ssrfTestConfig()
+	cfg.Transport = &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+		},
+	}
+
+	resp, err := NewClient(cfg).StandardClient().Get("http://local-agent/ping") //nolint:noctx // exercising the dialer
+	require.NoError(t, err, "a Unix socket has no IP for the policy to refuse")
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// unreadableAddr is a peer address that is neither a Unix socket nor parseable
+// as host:port, i.e. the case where an IP is being connected to and cannot be
+// judged.
+type unreadableAddr struct{}
+
+func (unreadableAddr) Network() string { return "weird" }
+func (unreadableAddr) String() string  { return "not-an-address" }
+
+type unreadableConn struct{ net.Conn }
+
+func (unreadableConn) RemoteAddr() net.Addr { return unreadableAddr{} }
+func (unreadableConn) Close() error         { return nil }
+
+// TestUnreadableDialedAddressStillFailsClosed is the counterpart to the Unix
+// case above: exempting a non-IP destination must not soften the genuinely
+// unjudgeable one.
+func TestUnreadableDialedAddressStillFailsClosed(t *testing.T) {
+	conn, err := checkDialedConn(unreadableConn{}, &IPPolicy{})
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrBlockedByPolicy)
+	assert.Nil(t, conn)
+	assert.Contains(t, err.Error(), "cannot determine the address dialed")
 }
 
 // TestCustomTLSDialHookIsChecked covers the hook net/http prefers over
