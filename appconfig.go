@@ -59,6 +59,13 @@ type AppConfig struct {
 	// When both this and AllowPrivateIPs are set, AllowedPrivateCIDRs wins:
 	// the resulting client reaches only the listed ranges.
 	AllowedPrivateCIDRs []string `json:"allowedPrivateCIDRs,omitempty" yaml:"allowedPrivateCIDRs,omitempty"`
+	// TrustProxyResolution allows a proxied request whose target hostname does
+	// not resolve here to proceed, leaving egress policy to the proxy.
+	//
+	// Defaults to false, which fails closed on any DNS failure for a proxied
+	// target. Enable it only in a proxy-only environment with no direct
+	// resolver, where the proxy is trusted to enforce egress policy itself.
+	TrustProxyResolution *bool `json:"trustProxyResolution,omitempty" yaml:"trustProxyResolution,omitempty"`
 	// MaxResponseBodySize is the maximum HTTP response body size in bytes.
 	MaxResponseBodySize int64 `json:"maxResponseBodySize,omitempty" yaml:"maxResponseBodySize,omitempty"`
 }
@@ -173,6 +180,13 @@ func NewClientFromAppConfig(cfg *AppConfig, logger logr.Logger) (*Client, error)
 		}
 		clientCfg.IPPolicy = policy
 	}
+	// Applies to whichever policy the config resolves to, including the
+	// implicit one, so it does not require AllowedPrivateCIDRs to be set.
+	if cfg.TrustProxyResolution != nil {
+		policy := *clientCfg.ipPolicy()
+		policy.TrustProxyResolution = *cfg.TrustProxyResolution
+		clientCfg.IPPolicy = &policy
+	}
 
 	// Apply max response body size
 	if cfg.MaxResponseBodySize > 0 {
@@ -251,6 +265,9 @@ func MergeAppConfig(base, override *AppConfig) *AppConfig {
 	// inherited exceptions; nil means "not specified" and inherits.
 	if override.AllowedPrivateCIDRs != nil {
 		merged.AllowedPrivateCIDRs = override.AllowedPrivateCIDRs
+	}
+	if override.TrustProxyResolution != nil {
+		merged.TrustProxyResolution = override.TrustProxyResolution
 	}
 	if override.MaxResponseBodySize > 0 {
 		merged.MaxResponseBodySize = override.MaxResponseBodySize

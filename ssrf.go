@@ -218,6 +218,23 @@ type IPPolicy struct {
 	// Resolver is used by ValidateURLResolved. Defaults to net.DefaultResolver.
 	// Exposed primarily so the resolved path can be tested without DNS.
 	Resolver Resolver
+
+	// TrustProxyResolution allows a proxied request whose target hostname this
+	// process cannot resolve ("no such host") to proceed, leaving egress
+	// policy to the proxy.
+	//
+	// Defaults to false, which fails closed: a proxied target that does not
+	// resolve here is refused, as is any other DNS failure. That is the secure
+	// default, because an attacker who can make a name unresolvable for this
+	// process -- by serving NXDOMAIN selectively, or by poisoning a local
+	// resolver -- would otherwise obtain an unchecked egress path through the
+	// proxy.
+	//
+	// Set it to true only in a proxy-only environment where the client
+	// genuinely has no direct resolver and the proxy is trusted to enforce
+	// egress policy itself. Even then it only relaxes "no such host"; every
+	// other DNS error stays fatal.
+	TrustProxyResolution bool
 }
 
 // Resolver is the subset of *net.Resolver that IPPolicy needs.
