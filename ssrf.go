@@ -564,17 +564,26 @@ func resolverIdentity(r Resolver) string {
 	v := reflect.ValueOf(r)
 	name := reflect.TypeOf(r).String()
 
-	switch v.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+	if _, hasAddress := addressableKinds[v.Kind()]; hasAddress {
 		if v.IsNil() {
 			return name + "(nil)"
 		}
 		return fmt.Sprintf("%s@%d", name, v.Pointer())
-	default:
-		// Slices are not comparable and %#v on one is still deterministic, so
-		// this stays safe for any shape a Resolver implementation might take.
-		return fmt.Sprintf("%s%#v", name, r)
 	}
+
+	// A value-shaped resolver has no address to take, so fall back to its
+	// contents. %#v is deterministic for any shape an implementation can have,
+	// including ones holding a slice, which is not comparable.
+	return fmt.Sprintf("%s%#v", name, r)
+}
+
+// addressableKinds are the reflect kinds whose Value.Pointer may be taken.
+var addressableKinds = map[reflect.Kind]struct{}{ //nolint:gochecknoglobals
+	reflect.Pointer:       {},
+	reflect.Map:           {},
+	reflect.Chan:          {},
+	reflect.Func:          {},
+	reflect.UnsafePointer: {},
 }
 
 // ControlFunc returns a net.Dialer.Control function that enforces the policy
