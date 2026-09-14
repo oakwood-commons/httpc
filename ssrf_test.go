@@ -64,10 +64,10 @@ func TestValidateURLNotPrivate(t *testing.T) {
 		{name: "IPv6 link-local", url: "http://[fe80::1]/", wantErr: true, errMsg: "private/reserved"},
 
 		// Blocked hostnames
-		{name: "localhost", url: "http://localhost/", wantErr: true, errMsg: "blocked hostname"},
-		{name: "localhost.localdomain", url: "http://localhost.localdomain/", wantErr: true, errMsg: "blocked hostname"},
-		{name: "LOCALHOST uppercase", url: "http://LOCALHOST/", wantErr: true, errMsg: "blocked hostname"},
-		{name: "metadata.google.internal", url: "http://metadata.google.internal/computeMetadata/v1/", wantErr: true, errMsg: "blocked hostname"},
+		{name: "localhost", url: "http://localhost/", wantErr: true, errMsg: "hostname"},
+		{name: "localhost.localdomain", url: "http://localhost.localdomain/", wantErr: true, errMsg: "hostname"},
+		{name: "LOCALHOST uppercase", url: "http://LOCALHOST/", wantErr: true, errMsg: "hostname"},
+		{name: "metadata.google.internal", url: "http://metadata.google.internal/computeMetadata/v1/", wantErr: true, errMsg: "hostname"},
 
 		// Non-canonical IP forms
 		{name: "hex IP 0x7f000001", url: "http://0x7f000001/", wantErr: true, errMsg: "non-canonical"},
@@ -78,7 +78,7 @@ func TestValidateURLNotPrivate(t *testing.T) {
 		// Edge cases
 		{name: "empty host (relative URL)", url: "/relative/path", wantErr: true, errMsg: "scheme"},
 		{name: "IP with port", url: "http://10.0.0.1:8080/", wantErr: true, errMsg: "private/reserved"},
-		{name: "localhost with port", url: "http://localhost:3000/", wantErr: true, errMsg: "blocked hostname"},
+		{name: "localhost with port", url: "http://localhost:3000/", wantErr: true, errMsg: "hostname"},
 		{name: "invalid URL", url: "://invalid", wantErr: true, errMsg: "invalid URL"},
 	}
 
@@ -135,19 +135,44 @@ func TestNonCanonicalIPPattern(t *testing.T) {
 	}
 }
 
+// TestBlockedHostnames pins the split between the two hostname tables: cloud
+// metadata names can never be re-enabled, whereas loopback names follow the
+// policy so a caller who deliberately allows loopback can still use the name.
 func TestBlockedHostnames(t *testing.T) {
-	expected := []string{
-		"localhost",
-		"localhost.localdomain",
-		"metadata.google.internal",
+	tests := []struct {
+		name    string
+		policy  *IPPolicy
+		rawURL  string
+		blocked bool
+	}{
+		{"localhost blocked by default", defaultIPPolicy, "http://localhost/", true},
+		{"localdomain blocked by default", defaultIPPolicy, "http://localhost.localdomain/", true},
+		{"trailing dot blocked by default", defaultIPPolicy, "http://LOCALHOST./", true},
+
+		{"localhost allowed when loopback is", mustPolicy(t, "127.0.0.0/8"), "http://localhost/", false},
+		{"localhost allowed via IPv6 loopback", mustPolicy(t, "::1/128"), "http://localhost/", false},
+		{"localhost allowed when all private is", AllowAllPrivateIPs(), "http://localhost/", false},
+		{"localhost still blocked by an unrelated exception", mustPolicy(t, "10.0.0.0/8"), "http://localhost/", true},
+
+		{"metadata name blocked by default", defaultIPPolicy, "http://metadata.google.internal/", true},
+		{"metadata name blocked when all private is allowed", AllowAllPrivateIPs(), "http://metadata.google.internal/", true},
+		{"metadata alias blocked when all private is allowed", AllowAllPrivateIPs(), "http://metadata.goog/", true},
+		{"metadata name blocked by an explicit exception", mustPolicy(t, "0.0.0.0/0", "::/0"), "http://metadata.google.internal/", true},
+
+		{"unrelated hostname allowed", defaultIPPolicy, "http://example.com/", false},
 	}
-	for _, h := range expected {
-		_, ok := blockedHostnames[h]
-		assert.True(t, ok, "expected %q to be in blockedHostnames", h)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.policy.ValidateURL(tt.rawURL)
+			if tt.blocked {
+				require.Error(t, err)
+				assert.ErrorIs(t, err, ErrBlockedByPolicy)
+				return
+			}
+			assert.NoError(t, err)
+		})
 	}
-	// Non-blocked hostname
-	_, ok := blockedHostnames["example.com"]
-	assert.False(t, ok)
 }
 
 // TestValidateURLNotPrivateReservedRanges covers reserved ranges that were
@@ -307,7 +332,7 @@ func TestValidateURLNotPrivateTrailingDot(t *testing.T) {
 		t.Run(u, func(t *testing.T) {
 			err := ValidateURLNotPrivate(u)
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "blocked hostname")
+			assert.Contains(t, err.Error(), "hostname")
 		})
 	}
 }
@@ -507,9 +532,29 @@ func TestIPPolicyFingerprint(t *testing.T) {
 		assert.NotEqual(t, nilPolicy.fingerprint(), (&IPPolicy{}).fingerprint())
 	})
 
-	t.Run("ignores the resolver", func(t *testing.T) {
+	t.Run("differs when the resolver differs", func(t *testing.T) {
+		// A custom resolver decides which addresses a proxied hostname is
+		// judged on, so it must not share cached verdicts with the default.
 		withResolver := &IPPolicy{Resolver: stubResolver{}}
-		assert.Equal(t, (&IPPolicy{}).fingerprint(), withResolver.fingerprint())
+		assert.NotEqual(t, (&IPPolicy{}).fingerprint(), withResolver.fingerprint())
+	})
+
+	t.Run("differs between two custom resolvers", func(t *testing.T) {
+		a := &IPPolicy{Resolver: stubResolver{addrs: []net.IPAddr{{IP: net.IPv4(8, 8, 8, 8)}}}}
+		b := &IPPolicy{Resolver: stubResolver{addrs: []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}}}
+		assert.NotEqual(t, a.fingerprint(), b.fingerprint())
+	})
+
+	t.Run("pointer resolvers are distinguished by identity", func(t *testing.T) {
+		a := &IPPolicy{Resolver: &countingResolver{count: new(atomic.Int64)}}
+		b := &IPPolicy{Resolver: &countingResolver{count: new(atomic.Int64)}}
+		assert.NotEqual(t, a.fingerprint(), b.fingerprint())
+	})
+
+	t.Run("the default resolver keeps a stable identity", func(t *testing.T) {
+		// Callers who inject nothing must keep cross-process cache reuse.
+		assert.Equal(t, (&IPPolicy{}).fingerprint(), (&IPPolicy{}).fingerprint())
+		assert.Equal(t, "default", resolverIdentity(nil))
 	})
 }
 

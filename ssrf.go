@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -185,15 +186,45 @@ var nonCanonicalIPPattern = regexp.MustCompile( //nolint:gochecknoglobals
 		`0[0-7]+(?:\.[0-7]+){0,3})$`, // octal: 0177.0.0.1
 )
 
-// blockedHostnames contains well-known hostnames that resolve to private or
-// metadata IP addresses. These are rejected before any DNS lookup happens so
-// that trivial bypasses such as http://localhost/... fail fast with a clear
-// message; the dial-time check is what actually guarantees enforcement.
-var blockedHostnames = map[string]struct{}{ //nolint:gochecknoglobals
-	"localhost":                {},
-	"localhost.localdomain":    {},
+// metadataHostnames name cloud instance-metadata endpoints. They are rejected
+// before any DNS lookup, and like the metadata CIDRs they are non-exemptible:
+// no policy can re-enable them.
+var metadataHostnames = map[string]struct{}{ //nolint:gochecknoglobals
 	"metadata.google.internal": {}, // GCP instance metadata
 	"metadata.goog":            {}, // GCP instance metadata (short alias)
+}
+
+// loopbackHostnames name the local host. Unlike the metadata names these
+// follow the policy: they are rejected only when the policy would also reject
+// the addresses they stand for, so a caller who has deliberately allowed
+// loopback can still reach http://localhost/ by name rather than being forced
+// to spell it 127.0.0.1.
+//
+// Rejecting them early is a fast, clear failure, not the guarantee -- the
+// dial-time check is what actually enforces the policy on whatever the name
+// resolves to.
+var loopbackHostnames = map[string]struct{}{ //nolint:gochecknoglobals
+	"localhost":             {},
+	"localhost.localdomain": {},
+}
+
+// loopbackIPs are the addresses the loopback hostnames stand for.
+var loopbackIPs = []net.IP{ //nolint:gochecknoglobals
+	net.IPv4(127, 0, 0, 1),
+	net.IPv6loopback,
+}
+
+// allowsLoopbackByName reports whether the policy permits at least one address
+// a loopback hostname resolves to. It is deliberately permissive between the
+// two families: which one the name resolves to varies by host, and the
+// dial-time check judges the address that is actually reached.
+func (p *IPPolicy) allowsLoopbackByName() bool {
+	for _, ip := range loopbackIPs {
+		if p.CheckIP(ip) == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // lowerHost lower-cases a hostname, which DNS treats as insignificant. The
@@ -207,7 +238,7 @@ func lowerHost(host string) string {
 }
 
 // hostAlias normalises a hostname for comparison against the static
-// blockedHostnames table, where the trailing dot IS insignificant: "LOCALHOST."
+// hostname tables, where the trailing dot IS insignificant: "LOCALHOST."
 // and "localhost" name the same well-known target, and the table holds no
 // entry whose meaning depends on search-domain expansion. Use this ONLY for
 // such alias matching -- never for a lookup or a cache key (see lowerHost).
@@ -385,11 +416,20 @@ func (p *IPPolicy) ValidateURL(rawURL string) error {
 
 	host = lowerHost(host)
 
-	// Block well-known hostnames that always resolve to private/metadata IPs.
-	// Matched on the alias form, where a trailing dot is insignificant.
-	if _, blocked := blockedHostnames[hostAlias(host)]; blocked {
+	// Block well-known hostnames that resolve to metadata or loopback
+	// addresses. Matched on the alias form, where a trailing dot is
+	// insignificant.
+	alias := hostAlias(host)
+	if _, blocked := metadataHostnames[alias]; blocked {
 		return fmt.Errorf(
-			"%w: request to blocked hostname %q is denied (resolves to a private/metadata address)",
+			"%w: request to cloud metadata hostname %q is denied and cannot be allowed by policy",
+			ErrBlockedByPolicy, host,
+		)
+	}
+	if _, isLoopback := loopbackHostnames[alias]; isLoopback && !p.allowsLoopbackByName() {
+		return fmt.Errorf(
+			"%w: request to loopback hostname %q is denied (resolves to a loopback address); "+
+				"allow 127.0.0.0/8 or ::1/128 to permit it",
 			ErrBlockedByPolicy, host,
 		)
 	}
@@ -468,19 +508,17 @@ func (p *IPPolicy) ValidateURLResolved(ctx context.Context, rawURL string) error
 // policy is never served to a client running a stricter one: the cache sits
 // above the transport, so a hit returns without any policy check having run.
 //
-// Only fields that change a verdict are included. Resolver is deliberately
-// excluded, and that is a known limitation rather than a claim of safety: a
-// custom resolver can change the verdict for a proxied hostname, so clients
-// sharing a CacheDir with identical CIDR settings but different resolvers
-// share a key prefix.
+// Only fields that change a verdict are included, and Resolver is one of them:
+// for a proxied hostname a custom resolver decides which addresses the target
+// is judged on, so two clients differing only in their resolver must not share
+// cached entries.
 //
-// Reaching that requires all of: a custom Resolver (exposed mainly as a test
-// seam), a proxy, a filesystem cache on a shared CacheDir, and two clients
-// whose resolvers disagree. Closing it means either hashing the resolver's
-// pointer identity, which silently ends cross-process cache reuse for every
-// custom-resolver caller, or adding a public identifier field to name it --
-// both worse than the gap they close. Revisit if the resolver becomes a
-// production knob rather than a test seam.
+// A resolver is identified by its concrete type plus, where it has one, its
+// pointer. A pointer is not stable across processes, so a client that injects
+// a resolver gets no cross-process reuse of a filesystem cache. That cost
+// falls on the same narrow population as the bug it prevents -- Resolver is
+// exposed mainly as a test seam -- and the default (nil) resolver keeps a
+// stable identity, so ordinary callers are unaffected.
 func (p *IPPolicy) fingerprint() string {
 	h := sha256.New()
 	if p == nil {
@@ -491,6 +529,7 @@ func (p *IPPolicy) fingerprint() string {
 	}
 
 	fmt.Fprintf(h, "allowPrivate=%t;trustProxyResolution=%t;", p.AllowPrivate, p.TrustProxyResolution)
+	fmt.Fprintf(h, "resolver=%s;", resolverIdentity(p.Resolver))
 
 	// Sort so two policies built from the same ranges in a different order
 	// share a key rather than silently halving the cache hit rate.
@@ -507,6 +546,35 @@ func (p *IPPolicy) fingerprint() string {
 	}
 
 	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// resolverIdentity describes a Resolver well enough to tell two of them apart
+// in a cache key. The nil resolver -- meaning net.DefaultResolver, the case
+// for every caller who does not inject one -- gets a fixed identity so its
+// cache entries stay reusable across processes.
+//
+// A pointer-shaped resolver is distinguished by its address, which separates
+// two instances of the same type within a process. A value-shaped one falls
+// back to its contents, since it has no address to take.
+func resolverIdentity(r Resolver) string {
+	if r == nil {
+		return "default"
+	}
+
+	v := reflect.ValueOf(r)
+	name := reflect.TypeOf(r).String()
+
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer:
+		if v.IsNil() {
+			return name + "(nil)"
+		}
+		return fmt.Sprintf("%s@%d", name, v.Pointer())
+	default:
+		// Slices are not comparable and %#v on one is still deterministic, so
+		// this stays safe for any shape a Resolver implementation might take.
+		return fmt.Sprintf("%s%#v", name, r)
+	}
 }
 
 // ControlFunc returns a net.Dialer.Control function that enforces the policy

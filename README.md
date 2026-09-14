@@ -225,7 +225,13 @@ IP ranges are blocked. The policy is enforced in three places:
 
 Cloud instance-metadata endpoints (`169.254.169.254`, `169.254.170.2`,
 `fd00:ec2::254`) are blocked unconditionally and cannot be re-enabled by any
-configuration.
+configuration. The same applies to the metadata hostnames
+(`metadata.google.internal`, `metadata.goog`).
+
+Loopback hostnames (`localhost`, `localhost.localdomain`) are different: they
+follow the policy. They are rejected by default, and permitted once the policy
+allows a loopback address, so allowing `127.0.0.0/8` or `::1/128` lets you use
+the name rather than forcing the literal.
 
 The one case where this library cannot enforce that itself is a name it never
 resolves: with `TrustProxyResolution` enabled, a proxied hostname that does not
@@ -291,9 +297,14 @@ the policy in.
 
 The response cache sits above the transport, so a cache hit is returned
 without the dial-time check running. Cache keys therefore include a digest of
-the IP policy: clients sharing a `CacheDir` but configured with different
+the IP policy -- including its resolver, which decides what a proxied hostname
+is judged on. Clients sharing a `CacheDir` but configured with different
 policies do not share entries, and a restrictive client is never served a
 response a permissive one fetched.
+
+A client that injects a custom `Resolver` is identified partly by pointer,
+which is not stable across processes, so it gets no cross-process reuse of a
+filesystem cache. Callers who do not set one are unaffected.
 
 A consequence worth knowing: changing the policy invalidates that client's
 cached entries, since the key changes with it.
