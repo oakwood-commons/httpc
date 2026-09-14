@@ -6,6 +6,7 @@ package httpc
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -78,7 +79,15 @@ func TestClientEnforcesPolicyAtDialTime(t *testing.T) {
 
 	client := NewClient(ssrfTestConfig())
 
-	resp, err := client.StandardClient().Get(server.URL) //nolint:noctx // exercising the dialer, not context handling
+	// A hostname, not the listener's IP literal: URL-level validation is
+	// bypassed here, so only resolution-time enforcement can catch this. If the
+	// dialer hook were removed, "localhost" would resolve to 127.0.0.1 and the
+	// request would succeed.
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(t, err)
+	target := "http://" + net.JoinHostPort("localhost", port) + "/"
+
+	resp, err := client.StandardClient().Get(target) //nolint:noctx // exercising the dialer, not context handling
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
@@ -729,4 +738,49 @@ func TestControlFuncStripsIPv6Zone(t *testing.T) {
 
 	// The zone must not launder a blocked address either.
 	assert.Error(t, defaultIPPolicy.ControlFunc()("tcp6", "[fe80::1%eth0]:80", nil))
+}
+
+// TestCloseReleasesIdleConnections pins that Client.Close releases the client's
+// own idle connections. Each client now owns a cloned transport rather than
+// sharing http.DefaultTransport, and none of the outer wrappers (otelhttp,
+// metrics, compression, cache) forward CloseIdleConnections, so
+// http.Client.CloseIdleConnections never reaches the inner transport.
+func TestCloseReleasesIdleConnections(t *testing.T) {
+	var idle atomic.Int64
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateIdle:
+			idle.Add(1)
+		case http.StateClosed, http.StateHijacked:
+			idle.Add(-1)
+		case http.StateNew, http.StateActive:
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	policy, err := NewIPPolicy("127.0.0.0/8", "::1/128")
+	require.NoError(t, err)
+
+	cfg := ssrfTestConfig()
+	cfg.IPPolicy = policy
+	client := NewClient(cfg)
+
+	resp, err := client.Get(context.Background(), server.URL)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	require.Eventually(t, func() bool { return idle.Load() == 1 }, time.Second, 10*time.Millisecond,
+		"connection should be pooled as idle before Close")
+
+	require.NoError(t, client.Close())
+
+	assert.Eventually(t, func() bool { return idle.Load() == 0 }, time.Second, 10*time.Millisecond,
+		"Close should release the client's idle connections")
 }

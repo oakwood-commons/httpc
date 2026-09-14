@@ -164,6 +164,11 @@ type Client struct {
 	cache          httpcache.Cache // Store reference to cache for clearing
 	circuitBreaker *circuitBreaker
 	metrics        Metrics
+	// idleCloser is the innermost transport, captured before setupTransport
+	// wraps it. Each client now owns its transport rather than sharing
+	// http.DefaultTransport, so Close must release that client's idle
+	// connections; none of the outer wrappers forward CloseIdleConnections.
+	idleCloser interface{ CloseIdleConnections() }
 }
 
 // NewClient creates a new HTTP client with the provided configuration
@@ -177,7 +182,7 @@ func NewClient(config *ClientConfig) *Client {
 		m = NoopMetrics{}
 	}
 
-	retryClient := newRetryClient(config, m)
+	retryClient, idleCloser := newRetryClient(config, m)
 	httpClient, cache := setupTransport(retryClient, config, m)
 
 	// Initialize circuit breaker if enabled
@@ -193,11 +198,15 @@ func NewClient(config *ClientConfig) *Client {
 		cache:          cache,
 		circuitBreaker: cb,
 		metrics:        m,
+		idleCloser:     idleCloser,
 	}
 }
 
 // newRetryClient creates and configures the underlying retryable HTTP client.
-func newRetryClient(config *ClientConfig, m Metrics) *retryablehttp.Client {
+// newRetryClient returns the configured retryable client and the innermost
+// transport, which the caller keeps so Client.Close can release that client's
+// idle connections (no outer wrapper forwards CloseIdleConnections).
+func newRetryClient(config *ClientConfig, m Metrics) (*retryablehttp.Client, interface{ CloseIdleConnections() }) {
 	retryClient := retryablehttp.NewClient()
 	retryClient.RetryMax = config.RetryMax
 	retryClient.RetryWaitMin = config.RetryWaitMin
@@ -232,10 +241,9 @@ func newRetryClient(config *ClientConfig, m Metrics) *retryablehttp.Client {
 
 	// Wrap the retryClient's inner transport with OTel tracing so every actual
 	// HTTP attempt gets a span and W3C Trace Context headers are injected.
-	{
-		base := newBaseTransport(config, policy, retryClient.HTTPClient.Transport)
-		retryClient.HTTPClient.Transport = otelhttp.NewTransport(base)
-	}
+	base := newBaseTransport(config, policy, retryClient.HTTPClient.Transport)
+	idleCloser, _ := base.(interface{ CloseIdleConnections() })
+	retryClient.HTTPClient.Transport = otelhttp.NewTransport(base)
 
 	// Validate redirect targets against the IP policy. net/http follows
 	// redirects automatically, so a public URL that 30x-redirects to a private
@@ -252,7 +260,7 @@ func newRetryClient(config *ClientConfig, m Metrics) *retryablehttp.Client {
 		return policy.ValidateURL(req.URL.String())
 	}
 
-	return retryClient
+	return retryClient, idleCloser
 }
 
 // ipPolicy resolves the effective IP policy for a config, honouring the
@@ -515,10 +523,10 @@ func (m *markingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	return m.base.RoundTrip(req.WithContext(ctx))
 }
 
-// CloseIdleConnections forwards to the wrapped transport. Note that the
-// outer wrappers (otelhttp, caching, metrics) do not implement the method, so
-// http.Client.CloseIdleConnections does not currently reach this; it is here so
-// the wrapper is not the reason the chain is broken.
+// CloseIdleConnections forwards to the wrapped transport. The outer wrappers
+// (otelhttp, caching, metrics) do not implement the method, so
+// http.Client.CloseIdleConnections does not reach this; Client.Close holds a
+// direct reference to the innermost transport and calls it there instead.
 func (m *markingTransport) CloseIdleConnections() {
 	m.base.CloseIdleConnections()
 }
@@ -935,6 +943,12 @@ func (c *Client) CacheStats() *CacheStats {
 // Close gracefully shuts down the client and cleans up resources
 // For filesystem cache, this performs a cleanup of expired entries
 func (c *Client) Close() error {
+	// Each client owns its transport, so its idle connections are not shared
+	// with any other client and must be released here.
+	if c.idleCloser != nil {
+		c.idleCloser.CloseIdleConnections()
+	}
+
 	if c.cache == nil {
 		return nil
 	}
