@@ -374,13 +374,28 @@ func policyTransport(t *http.Transport, policy *IPPolicy, logger logr.Logger) ht
 	return &markingTransport{base: clone}
 }
 
-// proxiedTargetTTL is how long a proxied target's verdict is reused. The Proxy
-// hook runs on every round trip, including ones served from an idle
-// connection, so without this a steady stream of requests to one host would
+// The Proxy hook runs on every round trip, including ones served from an idle
+// connection, so without a cache a steady stream of requests to one host would
 // pay a synchronous DNS round trip each time. Concurrent first requests to the
-// same host are not deduplicated; only repeats are. The window is far shorter
-// than the TOCTOU window this check already accepts by its nature.
-const proxiedTargetTTL = 30 * time.Second
+// same host are not deduplicated; only repeats are.
+//
+// The two verdict kinds get different lifetimes, because caching them has very
+// different consequences:
+//
+//   - proxiedTargetDenyTTL: a denial is a decision about the host that an
+//     attacker cannot usefully invalidate -- re-checking it sooner only costs
+//     lookups -- so denials are held for the longer window.
+//   - proxiedTargetAllowTTL: caching a success extends the window in which a
+//     DNS rebind can be laundered past the check, so it is kept short. One
+//     second still collapses a burst of requests to the same host into a
+//     single DNS lookup, which is where nearly all of the saving is, while
+//     shrinking the rebind window by 30x. It does not close that window: the
+//     check is inherently TOCTOU against the proxy's own resolution, cache or
+//     no cache.
+const (
+	proxiedTargetDenyTTL  = 30 * time.Second
+	proxiedTargetAllowTTL = 1 * time.Second
+)
 
 // maxProxiedTargetEntries caps the verdict cache. Targets can be
 // attacker-influenced (webhook fetchers, link previewers), so the cache must
@@ -404,6 +419,15 @@ type targetVerdict struct {
 	expires time.Time
 }
 
+// verdictTTL picks the lifetime for a verdict. Only the two deterministic
+// kinds reach here: a policy denial, or a success.
+func verdictTTL(err error) time.Duration {
+	if err != nil {
+		return proxiedTargetDenyTTL
+	}
+	return proxiedTargetAllowTTL
+}
+
 func (c *targetVerdictCache) check(host string, now time.Time, validate func() error) error {
 	if cached, ok := c.entries.Load(host); ok {
 		verdict, _ := cached.(*targetVerdict)
@@ -425,7 +449,7 @@ func (c *targetVerdictCache) check(host string, now time.Time, validate func() e
 	defer c.admit.Unlock()
 
 	c.evictIfFull(now)
-	if _, loaded := c.entries.Swap(host, &targetVerdict{err: err, expires: now.Add(proxiedTargetTTL)}); !loaded {
+	if _, loaded := c.entries.Swap(host, &targetVerdict{err: err, expires: now.Add(verdictTTL(err))}); !loaded {
 		c.size.Add(1)
 	}
 	return err
@@ -455,12 +479,12 @@ func (c *targetVerdictCache) evictIfFull(now time.Time) {
 // validateProxiedTarget checks a proxied request's target URL, resolving the
 // hostname so a name pointing at a blocked address is caught.
 //
-// A "no such host" answer is deliberately NOT fatal: in a proxy-only
-// environment the client often has no direct resolver, and a name this process
-// cannot resolve is not one it can be tricked into connecting to either. A
-// timeout or other temporary failure IS fatal, because there the name does
-// resolve -- just not for us right now -- and an attacker who can induce a
-// resolver hiccup would otherwise get an unchecked egress path.
+// A DNS failure is fatal by default, including "no such host": the name does
+// not resolve for us, but it may well resolve for the proxy, and an attacker
+// able to induce that state would otherwise get an unchecked egress path.
+// IPPolicy.TrustProxyResolution opts out of exactly the "no such host" case,
+// for proxy-only environments with no direct resolver; every other DNS error
+// stays fatal either way.
 func validateProxiedTarget(req *http.Request, policy *IPPolicy, cache *targetVerdictCache, logger logr.Logger) error {
 	err := cache.check(normaliseHost(req.URL.Hostname()), time.Now(), func() error {
 		return policy.ValidateURLResolved(req.Context(), req.URL.String())
@@ -469,7 +493,7 @@ func validateProxiedTarget(req *http.Request, policy *IPPolicy, cache *targetVer
 		return nil
 	}
 	var dnsErr *net.DNSError
-	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+	if policy.TrustProxyResolution && errors.As(err, &dnsErr) && dnsErr.IsNotFound {
 		logger.V(1).Info(
 			"httpc: proxied target does not resolve here; deferring egress policy to the proxy",
 			"host", req.URL.Hostname(), "error", err.Error(),

@@ -293,9 +293,20 @@ target, so the dial-time check cannot see the target address. In that case:
 - the target is validated in the proxy-selection hook instead, including a DNS
   lookup of the target host -- best-effort, with the TOCTOU window that dial-time
   enforcement otherwise avoids
-- if that lookup fails, the request proceeds and egress policy is left to the
-  proxy: a proxy-only environment often has no direct resolver, and a name this
-  process cannot resolve is not one it can be tricked into connecting to
+- if that lookup fails, the request is refused. This includes "no such host":
+  the name may still resolve for the proxy, and an attacker who can make a name
+  unresolvable here would otherwise gain an unchecked egress path. Set
+  `IPPolicy.TrustProxyResolution` (or `trustProxyResolution` in `AppConfig`) to
+  `true` to allow an unresolvable target through and defer to the proxy -- the
+  right setting for a proxy-only environment with no direct resolver, but it is
+  opt-in because the secure default is to fail closed. Even when enabled, only
+  "no such host" is relaxed; every other DNS error stays fatal.
+- verdicts are cached per host to avoid a DNS lookup on every round trip.
+  Denials are cached for 30s, successes for only 1s: a 1s window still collapses
+  a burst of requests to one host into a single lookup, while leaving a residual
+  1s window in which a DNS rebind could be laundered past the check. That window
+  is not closed entirely by any TTL -- this check is inherently TOCTOU against
+  the proxy's own resolution.
 
 #### Connection pooling
 

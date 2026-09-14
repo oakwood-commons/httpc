@@ -177,8 +177,38 @@ func TestAppConfigEmptyAllowedPrivateCIDRsWinsOverLegacyBoolean(t *testing.T) {
 	assert.Error(t, client.config.ipPolicy().ValidateURL("http://10.0.0.1/"))
 }
 
-// newFakeProxy returns a server that answers any proxied request itself,
-// plus the count of requests it saw.
+// TestAppConfigTrustProxyResolution pins both postures through the config
+// surface, including that the flag applies without any CIDR list being set.
+func TestAppConfigTrustProxyResolution(t *testing.T) {
+	// Absent: secure default, fail closed.
+	client, err := NewClientFromAppConfig(&AppConfig{}, logr.Discard())
+	require.NoError(t, err)
+	assert.False(t, client.config.ipPolicy().TrustProxyResolution)
+
+	trust := true
+	client, err = NewClientFromAppConfig(&AppConfig{TrustProxyResolution: &trust}, logr.Discard())
+	require.NoError(t, err)
+	assert.True(t, client.config.ipPolicy().TrustProxyResolution)
+	// The implicit policy must not have been mutated in place.
+	assert.False(t, defaultIPPolicy.TrustProxyResolution)
+
+	deny := false
+	client, err = NewClientFromAppConfig(
+		&AppConfig{TrustProxyResolution: &deny, AllowedPrivateCIDRs: []string{"10.0.0.0/8"}},
+		logr.Discard(),
+	)
+	require.NoError(t, err)
+	assert.False(t, client.config.ipPolicy().TrustProxyResolution)
+	assert.NoError(t, client.config.ipPolicy().ValidateURL("http://10.0.0.1/"),
+		"the CIDR exceptions must survive the flag being applied")
+
+	merged := MergeAppConfig(&AppConfig{}, &AppConfig{TrustProxyResolution: &trust})
+	require.NotNil(t, merged.TrustProxyResolution)
+	assert.True(t, *merged.TrustProxyResolution)
+	assert.Nil(t, MergeAppConfig(&AppConfig{}, &AppConfig{}).TrustProxyResolution)
+}
+
+// newFakeProxy returns a server that answers any proxied request itself,// plus the count of requests it saw.
 func newFakeProxy(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 	var seen atomic.Int64
@@ -407,19 +437,66 @@ func TestProxiedTargetResolveTimeoutIsFatal(t *testing.T) {
 	assert.Equal(t, int64(0), seen.Load())
 }
 
-// TestUnresolvableProxiedTargetIsNotFatal pins the deliberate choice that a
-// DNS failure does not block a proxied request: in a proxy-only environment
-// the client frequently has no direct resolver at all.
-func TestUnresolvableProxiedTargetIsNotFatal(t *testing.T) {
+// TestUnresolvableProxiedTargetFailsClosedByDefault pins the secure default:
+// a proxied target this process cannot resolve is refused, because the name
+// may still resolve for the proxy.
+func TestUnresolvableProxiedTargetFailsClosedByDefault(t *testing.T) {
 	proxy, seen := newFakeProxy(t)
-	client := NewClient(proxiedConfig(t, proxy))
+	cfg := proxiedConfig(t, proxy)
+	cfg.IPPolicy = &IPPolicy{Resolver: stubResolver{
+		err: &net.DNSError{Err: "no such host", Name: "example.test", IsNotFound: true},
+	}}
+	client := NewClient(cfg)
 
-	resp, err := client.Get(context.Background(), "http://does-not-exist.invalid/")
+	resp, err := client.Get(context.Background(), "http://example.test/")
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err, "an unresolvable proxied target must fail closed by default")
+	assert.Equal(t, int64(0), seen.Load(), "the request must not reach the proxy")
+}
+
+// TestUnresolvableProxiedTargetAllowedWhenProxyTrusted pins the opt-in
+// posture: with TrustProxyResolution set, an unresolvable target defers to the
+// proxy -- the proxy-only-environment case.
+func TestUnresolvableProxiedTargetAllowedWhenProxyTrusted(t *testing.T) {
+	proxy, seen := newFakeProxy(t)
+	cfg := proxiedConfig(t, proxy)
+	cfg.IPPolicy = &IPPolicy{
+		TrustProxyResolution: true,
+		Resolver: stubResolver{
+			err: &net.DNSError{Err: "no such host", Name: "example.test", IsNotFound: true},
+		},
+	}
+	client := NewClient(cfg)
+
+	resp, err := client.Get(context.Background(), "http://example.test/")
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, int64(1), seen.Load())
+}
+
+// TestTrustProxyResolutionDoesNotRelaxOtherDNSErrors pins that the opt-in
+// covers "no such host" only: a resolver timeout stays fatal either way.
+func TestTrustProxyResolutionDoesNotRelaxOtherDNSErrors(t *testing.T) {
+	proxy, seen := newFakeProxy(t)
+	cfg := proxiedConfig(t, proxy)
+	cfg.IPPolicy = &IPPolicy{
+		TrustProxyResolution: true,
+		Resolver: stubResolver{
+			err: &net.DNSError{Err: "i/o timeout", Name: "example.test", IsTimeout: true},
+		},
+	}
+	client := NewClient(cfg)
+
+	resp, err := client.Get(context.Background(), "http://example.test/")
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err)
+	assert.Equal(t, int64(0), seen.Load())
 }
 
 // TestBlockedRequestIsNotRetried guards against a policy denial being treated
@@ -509,7 +586,7 @@ func TestTargetVerdictCacheEvictsWhenFull(t *testing.T) {
 	require.Less(t, cache.size.Load(), int64(maxProxiedTargetEntries))
 
 	// Past the TTL the expired entries are swept instead.
-	later := now.Add(2 * proxiedTargetTTL)
+	later := now.Add(2 * proxiedTargetDenyTTL)
 	for i := range maxProxiedTargetEntries {
 		host := fmt.Sprintf("host-%d.test", i)
 		require.NoError(t, cache.check(host, now, func() error { return nil }))
@@ -553,8 +630,47 @@ func TestTargetVerdictCacheReusesDeterministicVerdicts(t *testing.T) {
 	assert.Equal(t, 1, calls, "a policy denial is deterministic and should be cached")
 
 	// Once the TTL lapses the verdict is recomputed.
-	require.ErrorIs(t, cache.check("blocked.test", now.Add(2*proxiedTargetTTL), blocked), ErrBlockedByPolicy)
+	require.ErrorIs(t, cache.check("blocked.test", now.Add(2*proxiedTargetDenyTTL), blocked), ErrBlockedByPolicy)
 	assert.Equal(t, 2, calls)
+}
+
+// TestTargetVerdictTTLsAreSplit pins the two lifetimes independently: a
+// success expires quickly, so the DNS-rebind window a cached allow opens stays
+// small, while a denial is held for the longer window. Collapsing the two back
+// into one shared TTL fails this test whichever value were kept.
+func TestTargetVerdictTTLsAreSplit(t *testing.T) {
+	require.Less(t, proxiedTargetAllowTTL, proxiedTargetDenyTTL,
+		"a cached success must not outlive a cached denial")
+
+	t.Run("success expires at the short TTL", func(t *testing.T) {
+		cache := &targetVerdictCache{}
+		now := time.Now()
+		calls := 0
+		allow := func() error { calls++; return nil }
+
+		require.NoError(t, cache.check("allowed.test", now, allow))
+		require.NoError(t, cache.check("allowed.test", now.Add(proxiedTargetAllowTTL/2), allow))
+		assert.Equal(t, 1, calls, "within the allow TTL the verdict is reused")
+
+		// Past the allow TTL but well inside the deny TTL: recomputed. If both
+		// verdicts shared the 30s TTL this would still be cached.
+		require.NoError(t, cache.check("allowed.test", now.Add(2*proxiedTargetAllowTTL), allow))
+		assert.Equal(t, 2, calls, "a success must not be reused past the allow TTL")
+	})
+
+	t.Run("denial survives the short TTL", func(t *testing.T) {
+		cache := &targetVerdictCache{}
+		now := time.Now()
+		calls := 0
+		deny := func() error { calls++; return ErrBlockedByPolicy }
+
+		require.ErrorIs(t, cache.check("blocked.test", now, deny), ErrBlockedByPolicy)
+
+		// Past the allow TTL, inside the deny TTL: still cached. If both
+		// verdicts shared the 1s TTL this would have been recomputed.
+		require.ErrorIs(t, cache.check("blocked.test", now.Add(2*proxiedTargetAllowTTL), deny), ErrBlockedByPolicy)
+		assert.Equal(t, 1, calls, "a denial must be held for the full deny TTL")
+	})
 }
 
 // TestTargetVerdictCacheStaysBoundedUnderConcurrency pins that admission is
