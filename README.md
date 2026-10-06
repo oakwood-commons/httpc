@@ -124,7 +124,7 @@ client := httpc.NewClientFromAppConfig(merged, logger)
 | `MemoryCacheSize` | `int` | `1000` | Maximum entries in memory cache |
 | `EnableCircuitBreaker` | `bool` | `false` | Enable circuit breaker pattern |
 | `CircuitBreakerConfig` | `*CircuitBreakerConfig` | See below | Circuit breaker settings |
-| `EnableCompression` | `bool` | `true` | Enable gzip compression |
+| `EnableCompression` | `bool` | `true` | Request gzip and decode it lazily (skipped for HEAD/Range requests, or when the caller sets its own `Accept-Encoding`) |
 | `AllowPrivateIPs` | `bool` | `false` | Deprecated: allow requests to all private/internal IPs |
 | `IPPolicy` | `*IPPolicy` | `nil` | Which destination IPs may be reached (see SSRF Protection) |
 | `Metrics` | `Metrics` | `NoopMetrics{}` | Metrics collector interface |

@@ -4,8 +4,6 @@
 package httpc
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -825,49 +823,15 @@ func TestNewFileCache_NilMetrics(t *testing.T) {
 
 type errCloser struct{ err error }
 
-func (e errCloser) Close() error { return e.err }
-
-func TestGzipReadCloser_CloseGzipError(t *testing.T) {
-	// When the gzip closer returns an error, it should be returned
-	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
-	gw.Write([]byte("hello"))
-	gw.Close()
-
-	gr, err := gzip.NewReader(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
-
-	// Read all data first
-	_, err = io.ReadAll(gr)
-	require.NoError(t, err)
-
-	grc := &gzipReadCloser{
-		reader: io.NopCloser(strings.NewReader("")),
-		gzip:   gr,
-		closer: io.NopCloser(strings.NewReader("")),
-	}
-	// Close should succeed (gzip reader is in good state after full read)
-	err = grc.Close()
-	assert.NoError(t, err)
-}
+func (e errCloser) Read(p []byte) (int, error) { return 0, io.EOF }
+func (e errCloser) Close() error               { return e.err }
 
 func TestGzipReadCloser_CloseOriginalBodyError(t *testing.T) {
-	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
-	gw.Write([]byte("hello"))
-	gw.Close()
-
-	gr, err := gzip.NewReader(bytes.NewReader(buf.Bytes()))
-	require.NoError(t, err)
-	_, _ = io.ReadAll(gr) // fully read
-
 	expectedErr := errors.New("original body close error")
 	grc := &gzipReadCloser{
-		reader: io.NopCloser(strings.NewReader("")),
-		gzip:   gr,
-		closer: errCloser{err: expectedErr},
+		body: errCloser{err: expectedErr},
 	}
-	err = grc.Close()
+	err := grc.Close()
 	assert.ErrorIs(t, err, expectedErr)
 }
 
